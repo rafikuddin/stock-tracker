@@ -3,7 +3,10 @@ package com.example.stocktracker
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
@@ -19,8 +22,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 data class Session(val token: String, val name: String, val email: String)
-data class Item(val brand: String, val sku: String, val pcs: Int)
-data class DistStat(val distributor: String, val submissions: Int, val totalPcs: Long, val last: String)
+data class Item(val brand: String, val sku: String, val pcs: Int, val sec: Double)
+data class SkuStat(val brand: String, val sku: String, val stock: Long, val secondary: Double)
+data class DistStat(val distributor: String, val submissions: Int, val totalPcs: Long, val totalSec: Double, val last: String, val skus: List<SkuStat>)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -101,8 +105,12 @@ fun Dashboard(s: Session, onLogout: () -> Unit) {
         loading = true; err = ""
         try {
             val a: JSONArray = api("dashboard", s.token).getJSONArray("data")
-            stats = (0 until a.length()).map { a.getJSONObject(it) }.map {
-                DistStat(it.getString("distributor"), it.getInt("submissions"), it.getLong("totalPcs"), it.optString("last"))
+            stats = (0 until a.length()).map { a.getJSONObject(it) }.map { d ->
+                val sk = d.getJSONArray("skus")
+                DistStat(d.getString("distributor"), d.getInt("submissions"), d.getLong("totalPcs"), d.getDouble("totalSecondary"), d.optString("last"),
+                    (0 until sk.length()).map { sk.getJSONObject(it) }.map { k ->
+                        SkuStat(k.getString("brand"), k.getString("sku"), k.getLong("stock"), k.getDouble("secondary"))
+                    })
             }
         } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { err = e.message ?: "Error" }
         loading = false
@@ -117,13 +125,7 @@ fun Dashboard(s: Session, onLogout: () -> Unit) {
         }
         if (err.isNotEmpty()) item { Text(err, color = MaterialTheme.colorScheme.error) }
         else if (stats.isEmpty()) item { Text("No data yet") }
-        items(stats) { d ->
-            Card(Modifier.fillMaxWidth()) { Column(Modifier.padding(12.dp)) {
-                Text(d.distributor, style = MaterialTheme.typography.titleSmall)
-                Text("Submissions: ${d.submissions}   |   Total pcs: ${d.totalPcs}")
-                Text("Last: ${d.last}", style = MaterialTheme.typography.bodySmall)
-            } }
-        }
+        items(stats) { d -> DistCard(d) }
     }
 }
 
@@ -135,6 +137,7 @@ fun SubmitScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit
     var brand by remember { mutableStateOf("") }
     var sku by remember { mutableStateOf("") }
     var pcs by remember { mutableStateOf("") }
+    var sec by remember { mutableStateOf("") }
     val items = remember { mutableStateListOf<Item>() }
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -149,16 +152,18 @@ fun SubmitScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit
             Text("Add Stock", style = MaterialTheme.typography.titleMedium)
             Dropdown("Brand", m.brands.keys.toList(), brand) { brand = it; sku = "" }
             Dropdown("SKU", m.brands[brand] ?: emptyList(), sku, brand.isNotEmpty()) { sku = it }
-            OutlinedTextField(pcs, { pcs = it.filter(Char::isDigit) }, label = { Text("Pcs") }, singleLine = true,
+            OutlinedTextField(pcs, { pcs = it.filter(Char::isDigit) }, label = { Text("Stock (pcs)") }, singleLine = true,
                 modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+            OutlinedTextField(sec, { sec = it.filter { c -> c.isDigit() || c == '.' } }, label = { Text("Secondary Sales (BDT)") }, singleLine = true,
+                modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
             Button({
-                val n = pcs.toIntOrNull()
-                if (brand.isNotEmpty() && sku.isNotEmpty() && n != null && n > 0) { items.add(Item(brand, sku, n)); sku = ""; pcs = "" }
+                val n = pcs.toIntOrNull() ?: 0; val sn = sec.toDoubleOrNull() ?: 0.0
+                if (brand.isNotEmpty() && sku.isNotEmpty() && n + sn > 0) { items.add(Item(brand, sku, n, sn)); sku = ""; pcs = ""; sec = "" }
             }, Modifier.fillMaxWidth()) { Text("+ Add Item") }
         }
         items(items.toList()) { i ->
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("${i.brand} / ${i.sku}: ${i.pcs} pcs", Modifier.weight(1f))
+                Text("${i.brand} / ${i.sku}\nStock: ${i.pcs}  |  Secondary: BDT ${bdt(i.sec)}", Modifier.weight(1f))
                 TextButton({ items.remove(i) }) { Text("Remove") }
             }
         }
@@ -170,7 +175,7 @@ fun SubmitScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit
                     try {
                         api("submit", s.token) {
                             put("region", region); put("zone", zone); put("distributor", dist)
-                            put("items", JSONArray(items.map { JSONObject().put("brand", it.brand).put("sku", it.sku).put("pcs", it.pcs) }))
+                            put("items", JSONArray(items.map { JSONObject().put("brand", it.brand).put("sku", it.sku).put("pcs", it.pcs).put("secondary", it.sec) }))
                         }
                         onDone()
                     } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { msg = e.message ?: "Failed" }
@@ -195,3 +200,31 @@ fun Dropdown(label: String, options: List<String>, selected: String, enabled: Bo
         }
     }
 }
+
+@Composable
+fun DistCard(d: DistStat) {
+    var open by remember { mutableStateOf(false) }
+    Card(Modifier.fillMaxWidth().clickable { open = !open }) { Column(Modifier.padding(12.dp)) {
+        Text(d.distributor, style = MaterialTheme.typography.titleSmall)
+        Text("Submissions: ${d.submissions}  |  Stock: ${d.totalPcs}  |  Secondary: BDT ${bdt(d.totalSec)}")
+        Text("Last: ${d.last}", style = MaterialTheme.typography.bodySmall)
+        Text(if (open) "Hide SKU details ▲" else "Show SKU details ▼", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+        if (open) {
+            HorizontalDivider(Modifier.padding(vertical = 6.dp))
+            Row(Modifier.fillMaxWidth()) {
+                Text("Brand / SKU", Modifier.weight(2f), fontWeight = FontWeight.Bold)
+                Text("Stock", Modifier.weight(1f), fontWeight = FontWeight.Bold, textAlign = TextAlign.End)
+                Text("Sec. Sales (BDT)", Modifier.weight(1f), fontWeight = FontWeight.Bold, textAlign = TextAlign.End)
+            }
+            d.skus.forEach { k ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                    Text("${k.brand} / ${k.sku}", Modifier.weight(2f))
+                    Text("${k.stock}", Modifier.weight(1f), textAlign = TextAlign.End)
+                    Text(bdt(k.secondary), Modifier.weight(1f), textAlign = TextAlign.End)
+                }
+            }
+        }
+    } }
+}
+
+fun bdt(v: Double): String = String.format(java.util.Locale.US, "%,.2f", v)
