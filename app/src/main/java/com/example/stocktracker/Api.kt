@@ -8,7 +8,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 // >>> Paste your Apps Script Web App URL here (ends with /exec) <<<
-const val API_URL = "PASTE_YOUR_WEB_APP_URL_HERE"
+const val API_URL = "https://script.google.com/macros/s/AKfycbzWCwhJZMHIj9iQqvvh-uI-8Mr3a53yAtbPKCJy4dPLnCtJ0XYILsXtfc7oPfp9CSLd/exec"
 
 class SessionExpired : Exception("Session expired, please login again")
 
