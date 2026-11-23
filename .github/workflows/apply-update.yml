@@ -1,0 +1,71 @@
+name: Apply update.zip
+
+# Upload a file named update.zip to the repo root -> this workflow unpacks it,
+# commits the changes, deletes the zip, and starts the "Build APK" workflow.
+on:
+  push:
+    paths: ['update.zip']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack update.zip
+        id: unpack
+        run: |
+          if [ ! -f update.zip ]; then
+            echo "No update.zip in the repo - nothing to do."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import zipfile, os
+          ROOTS = {'app', 'backend', 'worker', 'gradle'}
+          z = zipfile.ZipFile('update.zip')
+          names = [n for n in z.namelist()
+                   if not n.endswith('/') and not n.startswith('__MACOSX') and '/.DS_Store' not in n]
+          tops = {n.split('/')[0] for n in names}
+          # if everything sits inside ONE wrapper folder (e.g. StockApp/), drop that folder
+          strip = len(tops) == 1 and all('/' in n for n in names) and next(iter(tops)) not in ROOTS
+          count = 0
+          for n in names:
+              p = n.split('/', 1)[1] if strip else n
+              parts = p.split('/')
+              if not p or p.startswith('/') or '..' in parts or parts[0] in ('.github', '.git') or p == 'update.zip':
+                  print('skipped:', n); continue
+              os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+              with open(p, 'wb') as f:
+                  f.write(z.read(n))
+              print('updated:', p); count += 1
+          print(count, 'file(s) written')
+          PY
+          rm -f update.zip
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit changes
+        id: commit
+        if: steps.unpack.outputs.found == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "Apply update.zip"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Start APK build
+        if: steps.unpack.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref "${{ github.ref_name }}"
