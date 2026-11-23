@@ -38,10 +38,23 @@ fun JSONArray.strings(): List<String> = (0 until length()).map { getString(it) }
 fun JSONObject.keyList(): List<String> = keys().asSequence().toList()
 
 // regions: Region > Zone > Base > [Distributor]
-data class Master(val regions: Map<String, Map<String, Map<String, List<String>>>>, val brands: Map<String, List<String>>)
+// distBu:  "region|zone|base|distributor" -> BU      buBrands: BU > Brand > [SKU]
+data class Master(
+    val regions: Map<String, Map<String, Map<String, List<String>>>>,
+    val brands: Map<String, List<String>>,
+    val distBu: Map<String, String> = emptyMap(),
+    val buBrands: Map<String, Map<String, List<String>>> = emptyMap()
+)
 
 fun parseMaster(j: JSONObject): Master {
     val r = j.getJSONObject("regions"); val b = j.getJSONObject("brands")
+    val db = j.optJSONObject("distBu"); val bb = j.optJSONObject("buBrands")
+    val distBu: Map<String, String> = if (db == null) emptyMap() else db.keyList().associateWith { db.getString(it) }
+    val buBrands: Map<String, Map<String, List<String>>> = if (bb == null) emptyMap() else
+        bb.keyList().associateWith { bu ->
+            val o = bb.getJSONObject(bu)
+            o.keyList().associateWith { o.getJSONArray(it).strings() }
+        }
     return Master(
         r.keyList().associateWith { reg ->
             val z = r.getJSONObject(reg)
@@ -50,6 +63,7 @@ fun parseMaster(j: JSONObject): Master {
                 bs.keyList().associateWith { bn -> bs.getJSONArray(bn).strings() }
             }
         },
-        b.keyList().associateWith { b.getJSONArray(it).strings() }
+        b.keyList().associateWith { b.getJSONArray(it).strings() },
+        distBu, buBrands
     )
 }

@@ -666,6 +666,10 @@ fun StockScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit)
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    // The distributor's business unit decides which brands/SKUs are offered (falls back to all).
+    val bu = m.distBu["${loc.region}|${loc.zone}|${loc.base}|${loc.dist}"] ?: ""
+    val brandMap = m.buBrands[bu] ?: m.brands
+    LaunchedEffect(bu) { brand = ""; sku = "" }
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { PageTitle("Submit Stock", "Record SKU-wise stock for a distributor.") }
@@ -674,6 +678,7 @@ fun StockScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit)
                 Text("Distributor", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(12.dp))
                 LocationPicker(m, loc)
+                if (bu.isNotEmpty()) { Spacer(Modifier.height(10.dp)); StatusChip("BU: $bu  (showing $bu SKUs)") }
             }
         }
         item {
@@ -681,8 +686,8 @@ fun StockScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit)
                 Text("Add Stock (SKU wise)", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(12.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Dropdown("Brand", m.brands.keys.toList(), brand) { brand = it; sku = "" }
-                    Dropdown("SKU", m.brands[brand] ?: emptyList(), sku, brand.isNotEmpty()) { sku = it }
+                    Dropdown("Brand", brandMap.keys.toList(), brand) { brand = it; sku = "" }
+                    Dropdown("SKU", brandMap[brand] ?: emptyList(), sku, brand.isNotEmpty()) { sku = it }
                     AppField(pcs, { pcs = it.filter(Char::isDigit) }, "Pcs", keyboard = KeyboardType.Number)
                     PillButton("+ Add Item", {
                         val n = pcs.toIntOrNull() ?: 0

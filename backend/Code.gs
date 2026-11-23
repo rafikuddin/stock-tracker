@@ -1,12 +1,17 @@
 /**
  * Stock Tracker API - Google Apps Script (bound to the Google Sheet)
- * Sheets required: Users, Master_Distributor, Master_SKU, Submissions_Log, Stock_Items
+ * Master data comes straight from your two dump files, imported as tabs of this Sheet:
+ *   CUSTOMER_MASTER (tabs Adhesive / Corporate / Thinner)  -> Region > Zone > Base > Distributor
+ *   PRODUCT_MASTER  (tab SKU_MASTER)                        -> Brand > SKU
+ * Tabs are found by their column headers, so tab names do not matter.
+ * Other tabs: Users, Stock_Items, Sales_Log (created automatically).
  * Deploy: Deploy > New deployment > Web app > Execute as: Me, Who has access: Anyone
  */
 const SALT = 'CHANGE_THIS_SECRET_SALT';   // KEEP the value you already use
 const TOKEN_TTL = 21600;
-const STOCK_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','Brand','SKU','Pcs'];
-const SALES_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','SecondarySalesBDT'];                  // seconds (max 6h for CacheService)
+// (TOKEN_TTL above is in seconds; CacheService allows max 6h)
+const STOCK_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','Brand','SKU','Pcs','DistributorCode','BU','SKUCode'];
+const SALES_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','SecondarySalesBDT','DistributorCode','BU'];
 
 function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
@@ -42,10 +47,10 @@ function webData(token) {
   const tz = Session.getScriptTimeZone();
   function ts(v) { return Utilities.formatDate(new Date(v), tz, 'yyyy-MM-dd HH:mm'); }
   const stock = rows_('Stock_Items').filter(function (r) { return r[0]; }).map(function (r) {
-    return { id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], brand: r[7], sku: r[8], pcs: Number(r[9]) || 0 };
+    return { id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], brand: r[7], sku: r[8], pcs: Number(r[9]) || 0, dcode: r[10] || '', bu: r[11] || '', skucode: r[12] || '' };
   });
   const sales = rows_('Sales_Log').filter(function (r) { return r[0]; }).map(function (r) {
-    return { id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], amount: Number(r[7]) || 0 };
+    return { id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], amount: Number(r[7]) || 0, dcode: r[8] || '', bu: r[9] || '' };
   });
   return { ok: true, master: master_(), stock: stock, sales: sales };
 }
@@ -77,32 +82,90 @@ function login_(b) {
   return { ok: true, token: token, name: u[2] };
 }
 
-// regions: Region > Zone > Base > [Distributor];  brands: Brand > [SKU]
+/* ---------- Master data (read from the two dump tabs) ---------- */
+// Find tabs whose row-1 headers contain all of `need`; returns [{name, idx:{HEADER:col}, rows}]
+function tabsByHeaders_(need) {
+  const out = [];
+  ss_().getSheets().forEach(function (sh) {
+    if (sh.getLastRow() < 2 || sh.getLastColumn() < 2) return;
+    const head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(function (h) { return String(h).trim().toUpperCase(); });
+    const idx = {}; head.forEach(function (h, i) { if (h && !(h in idx)) idx[h] = i; });
+    if (need.every(function (n) { return n in idx; }))
+      out.push({ name: sh.getName(), idx: idx, rows: sh.getRange(2, 1, sh.getLastRow() - 1, head.length).getValues() });
+  });
+  return out;
+}
+function sortedObj_(o, valFn) {
+  const r = {}; Object.keys(o).sort().forEach(function (k) { r[k] = valFn ? valFn(o[k]) : o[k]; }); return r;
+}
+
+function loadMaster_() {
+  const st = { custTabs: [], skuTabs: [], dist: 0, distSkipped: 0, sku: 0, skuSkipped: 0 };
+  const regions = {}, distInfo = {}, brands = {}, buBrands = {}, skuInfo = {};
+
+  tabsByHeaders_(['REGION_BASE', 'ASM_BASE', 'BASE_NAME', 'DISTRIBUTOR_CODE', 'DISTRIBUTOR_NAME']).forEach(function (t) {
+    st.custTabs.push(t.name);
+    t.rows.forEach(function (r) {
+      const g = function (h) { return t.idx[h] === undefined ? '' : String(r[t.idx[h]]).trim(); };
+      const status = g('STATUS').toLowerCase();
+      const reg = g('REGION_BASE'), zone = g('ASM_BASE'), base = g('BASE_NAME'), name = g('DISTRIBUTOR_NAME');
+      const key = [reg, zone, base, name].join('|');
+      if ((status && status !== 'not deprecated') || !reg || !zone || !base || !name || distInfo[key]) { st.distSkipped++; return; }
+      distInfo[key] = { code: g('DISTRIBUTOR_CODE'), bu: g('BU') };
+      const z = regions[reg] = regions[reg] || {};
+      const b = z[zone] = z[zone] || {};
+      (b[base] = b[base] || []).push(name);
+      st.dist++;
+    });
+  });
+
+  tabsByHeaders_(['SKU_GROUP', 'ERP_SKU_CODE', 'ERP_SKU_NAME']).forEach(function (t) {
+    st.skuTabs.push(t.name);
+    t.rows.forEach(function (r) {
+      const g = function (h) { return t.idx[h] === undefined ? '' : String(r[t.idx[h]]).trim(); };
+      const status = g('SKU_STATUS').toLowerCase();
+      const brand = g('SKU_GROUP'), bu = g('BU_CATEGORY');
+      const name = g('ERP_SKU_NAME').replace(/^\[[^\]]*\]\s*/, '');   // drop "[43-001] " prefix
+      const key = brand + '|' + name;
+      if ((status && status !== 'active') || !brand || !name || skuInfo[key]) { st.skuSkipped++; return; }
+      skuInfo[key] = { code: g('ERP_SKU_CODE'), bu: bu };
+      (brands[brand] = brands[brand] || []).push(name);
+      if (bu) { const m = buBrands[bu] = buBrands[bu] || {}; (m[brand] = m[brand] || []).push(name); }
+      st.sku++;
+    });
+  });
+
+  return {
+    stats: st, distInfo: distInfo, skuInfo: skuInfo,
+    regions: sortedObj_(regions, function (z) { return sortedObj_(z, function (b) { return sortedObj_(b, function (l) { return l.sort(); }); }); }),
+    brands: sortedObj_(brands, function (l) { return l.sort(); }),
+    buBrands: sortedObj_(buBrands, function (m) { return sortedObj_(m, function (l) { return l.sort(); }); })
+  };
+}
+
+// regions: Region > Zone > Base > [Distributor];  brands: Brand > [SKU];
+// distBu: "region|zone|base|distributor" -> BU;  buBrands: BU > Brand > [SKU]
 function master_() {
-  const regions = {}, brands = {};
-  rows_('Master_Distributor').forEach(function (r) {
-    if (!r[0] || !r[1] || !r[2] || !r[3]) return;
-    const z = regions[r[0]] = regions[r[0]] || {};
-    const b = z[r[1]] = z[r[1]] || {};
-    (b[r[2]] = b[r[2]] || []).push(r[3]);
-  });
-  rows_('Master_SKU').forEach(function (r) {
-    if (!r[0] || !r[1]) return;
-    (brands[r[0]] = brands[r[0]] || []).push(r[1]);
-  });
-  return { ok: true, regions: regions, brands: brands };
+  const M = loadMaster_(), distBu = {};
+  Object.keys(M.distInfo).forEach(function (k) { if (M.distInfo[k].bu) distBu[k] = M.distInfo[k].bu; });
+  return { ok: true, regions: M.regions, brands: M.brands, distBu: distBu, buBrands: M.buBrands };
 }
 
 // body: {region, zone, base, distributor, items:[{brand, sku, pcs}]}
 function submitStock_(email, b) {
   if (!b.distributor || !b.items || !b.items.length) return { ok: false, error: 'Distributor and items required' };
+  const M = loadMaster_();
+  const di = M.distInfo[[b.region, b.zone, b.base, b.distributor].join('|')] || { code: '', bu: '' };
   const lock = LockService.getScriptLock(); lock.waitLock(20000);
   try {
     const id = Utilities.getUuid(), now = new Date();
     const rows = b.items.map(function (i) {
       const p = Number(i.pcs);
       if (!(p > 0)) throw new Error('Invalid pcs');
-      return [id, now, email, b.region, b.zone, b.base, b.distributor, i.brand, i.sku, p];
+      const si = M.skuInfo[i.brand + '|' + i.sku] || { code: '', bu: '' };
+      if (di.bu && M.buBrands[di.bu] && si.bu && si.bu !== di.bu)
+        throw new Error('"' + i.sku + '" is a ' + si.bu + ' SKU, but this distributor is ' + di.bu + '. Remove it and try again.');
+      return [id, now, email, b.region, b.zone, b.base, b.distributor, i.brand, i.sku, p, di.code, di.bu, si.code];
     });
     const sh = sheet_('Stock_Items', STOCK_HDR);
     sh.getRange(sh.getLastRow() + 1, 1, rows.length, STOCK_HDR.length).setValues(rows);
@@ -114,10 +177,11 @@ function submitStock_(email, b) {
 function submitSales_(email, b) {
   const amt = Number(b.amount);
   if (!b.distributor || !(amt > 0)) return { ok: false, error: 'Distributor and amount required' };
+  const di = loadMaster_().distInfo[[b.region, b.zone, b.base, b.distributor].join('|')] || { code: '', bu: '' };
   const lock = LockService.getScriptLock(); lock.waitLock(20000);
   try {
     const id = Utilities.getUuid();
-    sheet_('Sales_Log', SALES_HDR).appendRow([id, new Date(), email, b.region, b.zone, b.base, b.distributor, amt]);
+    sheet_('Sales_Log', SALES_HDR).appendRow([id, new Date(), email, b.region, b.zone, b.base, b.distributor, amt, di.code, di.bu]);
     return { ok: true, id: id };
   } finally { lock.releaseLock(); }
 }
@@ -157,7 +221,7 @@ function dashboard_() {
 
 /* ---------- Sheet menu: manage users ---------- */
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('Stock App').addItem('Add / reset user', 'addUser').addItem('Setup / migrate sheets', 'setupSheets').addToUi();
+  SpreadsheetApp.getUi().createMenu('Stock App').addItem('Add / reset user', 'addUser').addItem('Check master data', 'checkMaster').addToUi();
 }
 function addUser() {
   const ui = SpreadsheetApp.getUi();
@@ -176,23 +240,23 @@ function addUser() {
   ui.alert('User added');
 }
 
-/* One-time: migrate an existing sheet to Region > Zone > Base > Distributor layout */
-function setupSheets() {
-  const ui = SpreadsheetApp.getUi(), s = ss_();
-  if (ui.alert('Setup / migrate', 'This CLEARS old Stock_Items / Submissions_Log data and rebuilds headers. Users and Master sheets are kept. Continue?', ui.ButtonSet.YES_NO) !== ui.Button.YES) return;
-  const md = s.getSheetByName('Master_Distributor');
-  if (md.getRange('C1').getValue() !== 'Base') {
-    md.insertColumnAfter(2);
-    md.getRange('C1').setValue('Base');
-    const n = md.getLastRow() - 1;
-    if (n > 0) md.getRange(2, 3, n, 1).setValue('Base 1');   // placeholder - edit these
-  }
-  const old = s.getSheetByName('Submissions_Log'); if (old) s.deleteSheet(old);
-  ['Stock_Items', 'Sales_Log'].forEach(function (n) {
-    const sh = s.getSheetByName(n) || s.insertSheet(n); sh.clear();
+/* Shows what the app will load from the two dump tabs - run it after importing/refreshing them */
+function checkMaster() {
+  const ui = SpreadsheetApp.getUi(), M = loadMaster_(), st = M.stats;
+  let zones = 0, bases = 0; const buCount = {};
+  Object.keys(M.regions).forEach(function (r) {
+    zones += Object.keys(M.regions[r]).length;
+    Object.keys(M.regions[r]).forEach(function (z) { bases += Object.keys(M.regions[r][z]).length; });
   });
-  sheet_('Stock_Items', STOCK_HDR); sheet_('Sales_Log', SALES_HDR);
-  const d = s.getSheetByName('Dashboard') || s.insertSheet('Dashboard'); d.clear();
-  d.getRange('A1').setFormula('=IFERROR(QUERY(Sales_Log!A:H,"select D,E,F,G,sum(H) where G is not null group by D,E,F,G label D \'Region\', E \'Zone\', F \'Base\', G \'Distributor\', sum(H) \'Secondary Sales BDT\'",1),"No sales yet")');
-  ui.alert('Done. Now edit the "Base" column in Master_Distributor with your real base names.');
+  Object.keys(M.distInfo).forEach(function (k) { const b = M.distInfo[k].bu || '(none)'; buCount[b] = (buCount[b] || 0) + 1; });
+  const skuBu = Object.keys(M.buBrands).map(function (b) { return b + ': ' + Object.keys(M.buBrands[b]).length + ' brands'; }).join(', ');
+  let t = 'CUSTOMER MASTER\n';
+  t += st.custTabs.length ? '  tabs: ' + st.custTabs.join(', ') + '\n  active distributors: ' + st.dist + '  (skipped deprecated/blank/duplicate: ' + st.distSkipped + ')\n  regions ' +
+       Object.keys(M.regions).length + ', zones ' + zones + ', bases ' + bases + '\n  by BU: ' + Object.keys(buCount).map(function (b) { return b + ' ' + buCount[b]; }).join(', ') + '\n'
+     : '  NOT FOUND - import the customer master file (needs columns REGION_BASE, ASM_BASE, BASE_NAME, DISTRIBUTOR_CODE, DISTRIBUTOR_NAME).\n';
+  t += '\nPRODUCT MASTER\n';
+  t += st.skuTabs.length ? '  tabs: ' + st.skuTabs.join(', ') + '\n  active SKUs: ' + st.sku + '  (skipped inactive/blank/duplicate: ' + st.skuSkipped + ')\n  brands ' +
+       Object.keys(M.brands).length + '\n  ' + skuBu + '\n'
+     : '  NOT FOUND - import the product master file (needs columns SKU_GROUP, ERP_SKU_CODE, ERP_SKU_NAME).\n';
+  ui.alert('Master data check', t, ui.ButtonSet.OK);
 }

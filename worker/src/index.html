@@ -240,9 +240,13 @@ function compact(v){return v>=1e7?(v/1e7).toFixed(2)+' Cr':v>=1e5?(v/1e5).toFixe
 function show(id,on){$(id).classList.toggle('hide',!on)}
 function call(fn){var a=[].slice.call(arguments,1);
   if(window.google&&google.script&&google.script.run)return new Promise(function(ok,bad){google.script.run.withSuccessHandler(ok).withFailureHandler(function(e){bad(new Error(e.message||e))})[fn].apply(null,a)});
-  // standalone mode (Cloudflare Worker): talk to /api
+  // standalone mode (Cloudflare Worker / GitHub Pages): POST to the first reachable API url
   var body=fn==='webLogin'?{action:'login',email:a[0],password:a[1]}:{action:'webdata',token:a[0]};
-  return fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json()}).catch(function(){throw new Error('Cannot reach server')})}
+  var urls=window.API_URLS||['/api'];
+  function post(i){return fetch(urls[i],{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(body)})
+    .then(function(r){return r.text()}).then(function(t){try{return JSON.parse(t)}catch(e){throw new TypeError('bad reply')}})
+    .catch(function(e){if(i+1<urls.length)return post(i+1);throw new Error('Cannot reach server')})}
+  return post(0)}
 
 // ---- lamp scene
 (function(){
@@ -333,10 +337,10 @@ function render(){
   var st=D.stock.filter(pass),sl=D.sales.filter(pass);
   // overview: per distributor, stock = latest value per SKU, sales = sum
   var agg={};
-  function g(r){var k=[r.region,r.zone,r.base,r.dist].join('|');return agg[k]=agg[k]||{region:r.region,zone:r.zone,base:r.base,dist:r.dist,skus:{},sales:0,ss:0,sts:{},last:''}}
-  st.forEach(function(r){var a=g(r);a.sts[r.id]=1;if(r.ts>a.last)a.last=r.ts;var k=r.brand+'|'+r.sku,x=a.skus[k];
+  function g(r){var k=[r.region,r.zone,r.base,r.dist].join('|');return agg[k]=agg[k]||{region:r.region,zone:r.zone,base:r.base,dist:r.dist,skus:{},sales:0,ss:0,sts:{},last:'',code:'',bu:''}}
+  st.forEach(function(r){var a=g(r);a.code=a.code||r.dcode;a.bu=a.bu||r.bu;a.sts[r.id]=1;if(r.ts>a.last)a.last=r.ts;var k=r.brand+'|'+r.sku,x=a.skus[k];
     if(!x||r.ts>x.ts)a.skus[k]={ts:r.ts,pcs:r.pcs};else if(r.ts===x.ts)x.pcs+=r.pcs});
-  sl.forEach(function(r){var a=g(r);a.sales+=r.amount;a.ss++;if(r.ts>a.last)a.last=r.ts});
+  sl.forEach(function(r){var a=g(r);a.code=a.code||r.dcode;a.bu=a.bu||r.bu;a.sales+=r.amount;a.ss++;if(r.ts>a.last)a.last=r.ts});
   var ov=Object.keys(agg).sort().map(function(k){var a=agg[k],p=0;for(var s in a.skus)p+=a.skus[s].pcs;a.pcs=p;a.stockSubs=Object.keys(a.sts).length;return a});
   var tS=0,tA=0,tN=0;ov.forEach(function(a){tS+=a.pcs;tA+=a.sales;tN+=a.stockSubs+a.ss});
   $('tiles').innerHTML=
@@ -347,16 +351,16 @@ function render(){
   var top=ov.filter(function(a){return a.sales>0}).sort(function(x,y){return y.sales-x.sales}).slice(0,8),mx=top.length?top[0].sales:1;
   $('chart').innerHTML=top.length?top.map(function(a,i){var h=Math.max(4,a.sales/mx*130);
     return'<div class="bar'+(i===0?' first':'')+'" title="'+esc(a.dist)+': BDT '+num(a.sales,2)+'"><small>'+compact(a.sales)+'</small><div class="b" style="height:'+h+'px"></div><small>'+esc(a.dist)+'</small></div>'}).join(''):'<div class="empty" style="margin:auto">No sales in this filter</div>';
-  var ovRows=ov.map(function(a){return[a.region,a.zone,a.base,a.dist,a.pcs,a.sales.toFixed(2),a.stockSubs,a.ss,a.last]});
-  var ovHead=['Region','Zone','Base','Distributor','Stock (pcs)','Secondary Sales (BDT)','Stock subs','Sales subs','Last submission'];
+  var ovRows=ov.map(function(a){return[a.region,a.zone,a.base,a.dist,a.code,a.bu,a.pcs,a.sales.toFixed(2),a.stockSubs,a.ss,a.last]});
+  var ovHead=['Region','Zone','Base','Distributor','Dist. Code','BU','Stock (pcs)','Secondary Sales (BDT)','Stock subs','Sales subs','Last submission'];
   cur.ov={head:ovHead,rows:ovRows};
-  table('t_ov',ovHead,ovRows.map(function(r){var c=r.slice();c[4]=num(c[4]);c[5]=num(c[5],2);return c}),[4,5,6,7]);
-  var stHead=['Date','Region','Zone','Base','Distributor','Brand','SKU','Pcs','By'];
-  var stRows=st.slice().sort(function(a,b){return a.ts<b.ts?1:-1}).map(function(r){return[r.ts,r.region,r.zone,r.base,r.dist,r.brand,r.sku,r.pcs,r.by]});
-  cur.st={head:stHead,rows:stRows};table('t_st',stHead,stRows,[7]);$('c_st').textContent=stRows.length+' rows';
-  var slHead=['Date','Region','Zone','Base','Distributor','Amount (BDT)','By'];
-  var slRows=sl.slice().sort(function(a,b){return a.ts<b.ts?1:-1}).map(function(r){return[r.ts,r.region,r.zone,r.base,r.dist,r.amount.toFixed(2),r.by]});
-  cur.sl={head:slHead,rows:slRows};table('t_sl',slHead,slRows.map(function(r){var c=r.slice();c[5]=num(c[5],2);return c}),[5]);$('c_sl').textContent=slRows.length+' rows';
+  table('t_ov',ovHead,ovRows.map(function(r){var c=r.slice();c[6]=num(c[6]);c[7]=num(c[7],2);return c}),[6,7,8,9]);
+  var stHead=['Date','Region','Zone','Base','Distributor','Dist. Code','BU','Brand','SKU','SKU Code','Pcs','By'];
+  var stRows=st.slice().sort(function(a,b){return a.ts<b.ts?1:-1}).map(function(r){return[r.ts,r.region,r.zone,r.base,r.dist,r.dcode,r.bu,r.brand,r.sku,r.skucode,r.pcs,r.by]});
+  cur.st={head:stHead,rows:stRows};table('t_st',stHead,stRows,[10]);$('c_st').textContent=stRows.length+' rows';
+  var slHead=['Date','Region','Zone','Base','Distributor','Dist. Code','BU','Amount (BDT)','By'];
+  var slRows=sl.slice().sort(function(a,b){return a.ts<b.ts?1:-1}).map(function(r){return[r.ts,r.region,r.zone,r.base,r.dist,r.dcode,r.bu,r.amount.toFixed(2),r.by]});
+  cur.sl={head:slHead,rows:slRows};table('t_sl',slHead,slRows.map(function(r){var c=r.slice();c[7]=num(c[7],2);return c}),[7]);$('c_sl').textContent=slRows.length+' rows';
   if(stRows.length>MAXROWS||slRows.length>MAXROWS)$('sub').textContent=TITLES[tab][1]+' (table shows first '+MAXROWS+' rows - CSV has all.)';
 }
 

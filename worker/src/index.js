@@ -14,10 +14,18 @@ const SECURITY = {
     "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
 };
 
+// The page may also be hosted elsewhere (e.g. GitHub Pages). Auth is by login token, no cookies, so '*' is safe.
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Max-Age': '86400',
+};
+
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SECURITY },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SECURITY, ...CORS },
   });
 }
 
@@ -35,6 +43,7 @@ export default {
 
     // ---- API proxy -> Apps Script
     if (url.pathname === '/api') {
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
       if (request.method !== 'POST') return json({ ok: false, error: 'Method not allowed' }, 405);
       if (!env.APPS_SCRIPT_URL) return json({ ok: false, error: 'APPS_SCRIPT_URL is not set on the Worker' }, 500);
 
@@ -54,7 +63,7 @@ export default {
         });
         const text = await res.text();
         try { JSON.parse(text); } catch (e) { return json({ ok: false, error: 'Apps Script returned a web page instead of data. Re-deploy the script (Anyone access, new version).' }, 502); }
-        return new Response(text, { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SECURITY } });
+        return new Response(text, { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...SECURITY, ...CORS } });
       } catch (e) {
         return json({ ok: false, error: 'Cannot reach Apps Script' }, 502);
       }
