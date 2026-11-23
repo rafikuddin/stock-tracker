@@ -7,7 +7,6 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-// >>> Paste your Apps Script Web App URL here (ends with /exec) <<<
 const val API_URL = "https://script.google.com/macros/s/AKfycbzWCwhJZMHIj9iQqvvh-uI-8Mr3a53yAtbPKCJy4dPLnCtJ0XYILsXtfc7oPfp9CSLd/exec"
 
 class SessionExpired : Exception("Session expired, please login again")
@@ -21,7 +20,12 @@ suspend fun api(action: String, token: String = "", build: JSONObject.() -> Unit
         c.setRequestProperty("Content-Type", "text/plain")
         c.outputStream.use { it.write(body.toString().toByteArray()) }
         val stream = if (c.responseCode < 400) c.inputStream else c.errorStream
-        val res = JSONObject(stream.bufferedReader().readText())
+        val raw = stream.bufferedReader().readText()
+        val res = try { JSONObject(raw) } catch (e: Exception) {
+            val txt = raw.replace(Regex("<style[\\s\\S]*?</style>|<script[\\s\\S]*?</script>|<[^>]+>"), " ")
+                .replace(Regex("\\s+"), " ").trim().take(250)
+            throw Exception("Server returned a web page instead of data (HTTP ${c.responseCode}): $txt")
+        }
         if (!res.optBoolean("ok")) {
             val err = res.optString("error", "Request failed")
             if (err == "SESSION_EXPIRED") throw SessionExpired()
@@ -33,12 +37,19 @@ suspend fun api(action: String, token: String = "", build: JSONObject.() -> Unit
 fun JSONArray.strings(): List<String> = (0 until length()).map { getString(it) }
 fun JSONObject.keyList(): List<String> = keys().asSequence().toList()
 
-data class Master(val regions: Map<String, Map<String, List<String>>>, val brands: Map<String, List<String>>)
+// regions: Region > Zone > Base > [Distributor]
+data class Master(val regions: Map<String, Map<String, Map<String, List<String>>>>, val brands: Map<String, List<String>>)
 
 fun parseMaster(j: JSONObject): Master {
     val r = j.getJSONObject("regions"); val b = j.getJSONObject("brands")
     return Master(
-        r.keyList().associateWith { reg -> r.getJSONObject(reg).let { z -> z.keyList().associateWith { z.getJSONArray(it).strings() } } },
+        r.keyList().associateWith { reg ->
+            val z = r.getJSONObject(reg)
+            z.keyList().associateWith { zn ->
+                val bs = z.getJSONObject(zn)
+                bs.keyList().associateWith { bn -> bs.getJSONArray(bn).strings() }
+            }
+        },
         b.keyList().associateWith { b.getJSONArray(it).strings() }
     )
 }

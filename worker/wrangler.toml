@@ -1,0 +1,11 @@
+name = "stock-tracker"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# Your Apps Script Web App URL (the one ending in /exec).
+# You can also set/override this later in Cloudflare: Workers > stock-tracker > Settings > Variables.
+[vars]
+APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzWCwhJZMHIj9iQqvvh-uI-8Mr3a53yAtbPKCJy4dPLnCtJ0XYILsXtfc7oPfp9CSLd/exec"
+
+# Optional: your own domain (domain must be on Cloudflare). Uncomment and edit.
+# routes = [{ pattern = "stock.example.com", custom_domain = true }]

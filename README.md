@@ -1,5 +1,8 @@
-# Stock Tracker (Android + Google Sheets backend)
-1. Deploy Code.gs as a Web App from your Google Sheet (see instructions).
-2. Open app/src/main/java/com/example/stocktracker/Api.kt and set API_URL to your Web App URL.
-3. Push to GitHub. Actions > "Build APK" > download artifact `stock-app-debug` and install on phone.
-Local build: open in Android Studio and Run.
+# Stock Tracker
+- app/      Android app (Kotlin + Compose). Build: Actions > "Build APK".
+- backend/  Reference copies of the Google Apps Script (Code.gs, Index.html) and Master_SKU.csv. Apps Script itself is deployed from script.google.com.
+- worker/   Optional Cloudflare Worker (serves the web viewer + /api proxy).
+
+## Auto-update
+Upload `update.zip` to the repo root. The "Apply update.zip" workflow unpacks it, commits the changes,
+deletes the zip and starts the APK build.
