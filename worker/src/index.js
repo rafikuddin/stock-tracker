@@ -1,7 +1,7 @@
 import html from './index.html';
 
 // Actions the public /api endpoint is allowed to forward to Apps Script.
-const ALLOWED = new Set(['login', 'master', 'submit_stock', 'submit_sales', 'dashboard', 'webdata']);
+const ALLOWED = new Set(['login', 'master', 'submit_stock', 'submit_sales', 'dashboard', 'webdata', 'admin']);
 const MAX_BODY = 200 * 1024; // 200 KB
 
 const SECURITY = {

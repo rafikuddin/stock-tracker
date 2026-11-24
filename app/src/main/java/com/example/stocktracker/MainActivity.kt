@@ -23,6 +23,7 @@ import kotlinx.coroutines.delay
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -38,14 +39,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -55,6 +55,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -62,16 +64,17 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 // ---------------------------------------------------------------- data
-data class Session(val token: String, val name: String, val email: String)
+data class Session(val token: String, val name: String, val email: String, val role: String = "user")
 data class Item(val brand: String, val sku: String, val pcs: Int)
 data class SkuStat(val brand: String, val sku: String, val stock: Long)
 data class DistStat(
     val region: String, val zone: String, val base: String, val distributor: String,
     val stockSubs: Int, val salesSubs: Int, val totalPcs: Long, val totalSales: Double,
-    val last: String, val skus: List<SkuStat>
+    val last: String, val bu: String, val skus: List<SkuStat>
 )
 
 fun bdt(v: Double): String = String.format(Locale.US, "%,.2f", v)
+fun whole(v: Long): String = String.format(Locale.US, "%,d", v)
 fun compact(v: Double): String = when {
     v >= 1e7 -> String.format(Locale.US, "%.2f Cr", v / 1e7)
     v >= 1e5 -> String.format(Locale.US, "%.2f Lac", v / 1e5)
@@ -84,25 +87,83 @@ fun greeting(): String {
     return if (h < 12) "Good morning" else if (h < 17) "Good afternoon" else "Good evening"
 }
 
+// ---- Business units: the BU filter is shown first on every screen
+private val BU_ORDER = listOf("Adhesive", "Thinner", "DOP", "Trading-HO")
+
+fun sortBu(list: List<String>): List<String> =
+    list.filter { it.isNotBlank() }.distinct()
+        .sortedWith(compareBy<String>({ val i = BU_ORDER.indexOf(it); if (i < 0) 99 else i }, { it }))
+
+fun Master.bus(): List<String> = sortBu(distBu.values.toList())
+
+typealias Tree = Map<String, Map<String, Map<String, List<String>>>>
+
+// Region > Zone > Base > Distributor, keeping only the distributors of one BU ("" = all BUs)
+fun Master.forBu(bu: String): Tree {
+    if (bu.isEmpty()) return regions
+    val out = LinkedHashMap<String, Map<String, Map<String, List<String>>>>()
+    for ((reg, zones) in regions) {
+        val zo = LinkedHashMap<String, Map<String, List<String>>>()
+        for ((zone, bases) in zones) {
+            val bo = LinkedHashMap<String, List<String>>()
+            for ((base, dists) in bases) {
+                val keep = dists.filter { distBu["$reg|$zone|$base|$it"] == bu }
+                if (keep.isNotEmpty()) bo[base] = keep
+            }
+            if (bo.isNotEmpty()) zo[zone] = bo
+        }
+        if (zo.isNotEmpty()) out[reg] = zo
+    }
+    return out
+}
+
 class Loc {
+    var bu by mutableStateOf("")
     var region by mutableStateOf(""); var zone by mutableStateOf("")
     var base by mutableStateOf(""); var dist by mutableStateOf("")
+    fun key(): String = "$region|$zone|$base|$dist"
+    // Picking another BU starts the Region > Zone > Base > Distributor choice again
+    fun selectBu(v: String) { if (v == bu) return; bu = v; region = ""; zone = ""; base = ""; dist = "" }
+    // After a submit the BU filter stays (people usually work inside one BU)
     fun reset() { region = ""; zone = ""; base = ""; dist = "" }
 }
 
+// Entries are kept here (not inside the screen) so switching tabs never loses them
+class StockDraft {
+    val loc = Loc()
+    var brand by mutableStateOf(""); var sku by mutableStateOf(""); var pcs by mutableStateOf("")
+    val items = mutableStateListOf<Item>()
+}
+
+class SalesDraft {
+    val loc = Loc()
+    var amount by mutableStateOf("")
+}
+
 // ---------------------------------------------------------------- design tokens
-private val Bg = Color(0xFFF1F1F4)
-private val Ink = Color(0xFF111111)
-private val Muted = Color(0xFF6E6E78)
+private val Bg = Color(0xFFF2F3F8)
+private val Ink = Color(0xFF12142A)
+private val Muted = Color(0xFF6B6F80)
 private val Accent = Color(0xFF4F46E5)
-private val Soft = Color(0xFFF6F6F8)
+private val AccentSoft = Color(0xFFECEBFF)
+private val Soft = Color(0xFFF4F5F9)
+private val Line = Color(0xFFE6E8F0)
 private val GreenBg = Color(0xFFE6F6EC)
 private val Green = Color(0xFF1B9B52)
 private val RedBg = Color(0xFFFDECEC)
 private val Red = Color(0xFFD33F3F)
 private val CardShape = RoundedCornerShape(24.dp)
 private val Pill = RoundedCornerShape(50)
-private val HeroBrush = Brush.linearGradient(listOf(Color(0xFF4338CA), Color(0xFF6D5CFF)))
+private val HeroBrush = Brush.linearGradient(listOf(Color(0xFF3730A3), Color(0xFF6D5CFF)))
+
+// BU colour: (background, text)
+fun buColors(bu: String): Pair<Color, Color> = when (bu) {
+    "Adhesive" -> Color(0xFFFFEFD2) to Color(0xFFB45309)
+    "Thinner" -> Color(0xFFD7F2EE) to Color(0xFF0F766E)
+    "DOP" -> Color(0xFFEBE3FF) to Color(0xFF6D28D9)
+    "Trading-HO" -> Color(0xFFE2E7F0) to Color(0xFF334155)
+    else -> Color(0xFFE8E9EE) to Color(0xFF6B6F80)
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -114,6 +175,50 @@ class MainActivity : ComponentActivity() {
                     surfaceTint = Color.Transparent, error = Red
                 )
             ) { Surface(Modifier.fillMaxSize(), color = Bg) { Root() } }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- icons (drawn, no icon library needed)
+@Composable
+fun Icon24(kind: String, color: Color, boxSize: Dp = 24.dp) {
+    Canvas(Modifier.size(boxSize)) {
+        val u = this.size.width / 24f
+        val st = Stroke(width = 2f * u, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        fun pt(x: Float, y: Float) = Offset(x * u, y * u)
+        when (kind) {
+            "dash" -> {
+                val r = CornerRadius(2.5f * u, 2.5f * u)
+                for (o in listOf(pt(3.5f, 3.5f), pt(13.5f, 3.5f), pt(3.5f, 13.5f), pt(13.5f, 13.5f)))
+                    drawRoundRect(color, o, Size(7f * u, 7f * u), r, style = st)
+            }
+            "stock" -> {
+                drawRoundRect(color, pt(3.5f, 8f), Size(17f * u, 12.5f * u), CornerRadius(3f * u, 3f * u), style = st)
+                drawLine(color, pt(3.5f, 13f), pt(20.5f, 13f), strokeWidth = 2f * u, cap = StrokeCap.Round)
+                drawLine(color, pt(8f, 3.5f), pt(16f, 3.5f), strokeWidth = 2f * u, cap = StrokeCap.Round)
+            }
+            "sales" -> {
+                drawLine(color, pt(6f, 20f), pt(6f, 13f), strokeWidth = 2.8f * u, cap = StrokeCap.Round)
+                drawLine(color, pt(12f, 20f), pt(12f, 8.5f), strokeWidth = 2.8f * u, cap = StrokeCap.Round)
+                drawLine(color, pt(18f, 20f), pt(18f, 4f), strokeWidth = 2.8f * u, cap = StrokeCap.Round)
+            }
+            "chev" -> {
+                val p = Path().apply { moveTo(6f * u, 9f * u); lineTo(12f * u, 15f * u); lineTo(18f * u, 9f * u) }
+                drawPath(p, color, style = st)
+            }
+            "check" -> {
+                val p = Path().apply { moveTo(5f * u, 12.5f * u); lineTo(10f * u, 17.5f * u); lineTo(19f * u, 7f * u) }
+                drawPath(p, color, style = st)
+            }
+            "close" -> {
+                drawLine(color, pt(6f, 6f), pt(18f, 18f), strokeWidth = 2f * u, cap = StrokeCap.Round)
+                drawLine(color, pt(18f, 6f), pt(6f, 18f), strokeWidth = 2f * u, cap = StrokeCap.Round)
+            }
+            "search" -> {
+                drawCircle(color, 6.5f * u, pt(10.5f, 10.5f), style = st)
+                drawLine(color, pt(15.5f, 15.5f), pt(20f, 20f), strokeWidth = 2f * u, cap = StrokeCap.Round)
+            }
+            else -> {}
         }
     }
 }
@@ -134,37 +239,52 @@ fun PillButton(text: String, onClick: () -> Unit, modifier: Modifier = Modifier,
         onClick = onClick, modifier = modifier.height(50.dp), enabled = enabled, shape = Pill,
         colors = ButtonDefaults.buttonColors(
             containerColor = if (dark) Ink else Soft, contentColor = if (dark) Color.White else Ink,
-            disabledContainerColor = Color(0xFFC9C9D1), disabledContentColor = Color.White
+            disabledContainerColor = Color(0xFFC9CBD6), disabledContentColor = Color.White
         ),
-        contentPadding = PaddingValues(horizontal = 20.dp)
-    ) { Text(text, fontWeight = FontWeight.Medium) }
+        contentPadding = PaddingValues(horizontal = 22.dp)
+    ) { Text(text, fontWeight = FontWeight.SemiBold) }
 }
 
 @Composable
-fun StatusChip(text: String, onDark: Boolean = false, good: Boolean = true) {
-    val bg = if (onDark) Color.White.copy(alpha = 0.2f) else if (good) GreenBg else Soft
-    val fg = if (onDark) Color.White else if (good) Green else Muted
+fun StatusChip(text: String, good: Boolean = true) {
+    val bg = if (good) GreenBg else Soft
+    val fg = if (good) Green else Muted
     Text(text, Modifier.background(bg, Pill).padding(horizontal = 10.dp, vertical = 3.dp), color = fg, fontSize = 11.sp, maxLines = 1)
 }
 
 @Composable
-fun StatTile(title: String, value: String, sub: String, modifier: Modifier = Modifier, hero: Boolean = false) {
-    val shape = RoundedCornerShape(22.dp)
-    val bgMod = if (hero) Modifier.background(HeroBrush, shape) else Modifier.background(Color.White, shape)
-    Column(modifier.then(bgMod).padding(16.dp)) {
-        Text(title, color = if (hero) Color.White.copy(alpha = 0.8f) else Muted, fontSize = 13.sp, maxLines = 1)
-        Spacer(Modifier.height(10.dp))
-        Text(value, color = if (hero) Color.White else Ink, fontSize = 24.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-        Spacer(Modifier.height(8.dp))
-        StatusChip(sub, onDark = hero)
+fun BuTag(bu: String) {
+    val (bg, fg) = buColors(bu)
+    Text(bu, Modifier.background(bg, Pill).padding(horizontal = 10.dp, vertical = 3.dp), color = fg, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+}
+
+@Composable
+fun Chip(text: String, selected: Boolean, accent: Color, onClick: () -> Unit) {
+    Text(
+        text, color = if (selected) Color.White else Ink, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1,
+        modifier = Modifier.clip(Pill).background(if (selected) accent else Soft).clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 9.dp)
+    )
+}
+
+@Composable
+fun BuChips(bus: List<String>, selected: String, onSelect: (String) -> Unit) {
+    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Chip("All", selected.isEmpty(), Ink) { onSelect("") }
+        bus.forEach { b -> Chip(b, selected == b, buColors(b).second) { onSelect(b) } }
     }
 }
 
 @Composable
+fun SmallCaps(text: String) {
+    Text(text, fontSize = 10.sp, letterSpacing = 1.5.sp, color = Muted, fontWeight = FontWeight.SemiBold)
+}
+
+@Composable
 fun PageTitle(title: String, sub: String) {
-    Column(Modifier.padding(top = 16.dp, bottom = 4.dp)) {
-        Text(title, fontSize = 30.sp, lineHeight = 34.sp, fontWeight = FontWeight.Medium, color = Ink)
-        Text(sub, color = Muted, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
+    Column(Modifier.padding(top = 4.dp, bottom = 2.dp)) {
+        Text(title, fontSize = 26.sp, lineHeight = 30.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+        Text(sub, color = Muted, fontSize = 13.sp, modifier = Modifier.padding(top = 2.dp))
     }
 }
 
@@ -194,19 +314,69 @@ fun AppField(
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+// A tap opens a list you can search - much quicker than a drop-down for 47 brands / 344 SKUs
 @Composable
-fun Dropdown(label: String, options: List<String>, selected: String, enabled: Boolean = true, onSelect: (String) -> Unit) {
-    var exp by remember { mutableStateOf(false) }
-    ExposedDropdownMenuBox(expanded = exp, onExpandedChange = { if (enabled) exp = !exp }) {
-        OutlinedTextField(
-            value = selected, onValueChange = {}, readOnly = true, enabled = enabled, label = { Text(label) },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(exp) },
-            shape = RoundedCornerShape(16.dp), colors = fieldColors(),
-            modifier = Modifier.menuAnchor().fillMaxWidth()
-        )
-        ExposedDropdownMenu(expanded = exp, onDismissRequest = { exp = false }) {
-            options.forEach { o -> DropdownMenuItem(text = { Text(o) }, onClick = { onSelect(o); exp = false }) }
+fun PickerField(
+    label: String, value: String, options: List<String>, modifier: Modifier = Modifier,
+    enabled: Boolean = true, hint: String = "Select", onSelect: (String) -> Unit
+) {
+    var open by remember { mutableStateOf(false) }
+    Row(
+        modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+            .background(if (enabled) Soft else Color(0xFFEDEEF2))
+            .clickable(enabled = enabled) { open = true }
+            .padding(start = 16.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, fontSize = 11.sp, color = if (enabled) Muted else Color(0xFFA5A5AE))
+            Text(
+                if (value.isEmpty()) hint else value, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                fontWeight = if (value.isEmpty()) FontWeight.Normal else FontWeight.Medium,
+                color = if (value.isEmpty()) Color(0xFF9A9CAB) else Ink
+            )
+        }
+        Icon24("chev", if (enabled) Muted else Color(0xFFB8BAC6), 22.dp)
+    }
+    if (open) PickerDialog(label, options, value, { open = false }) { onSelect(it); open = false }
+}
+
+@Composable
+fun PickerDialog(title: String, options: List<String>, selected: String, onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    var q by remember { mutableStateOf("") }
+    val shown = remember(q, options) { if (q.isBlank()) options else options.filter { it.contains(q.trim(), ignoreCase = true) } }
+    Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Column(
+            Modifier.padding(horizontal = 16.dp).fillMaxWidth().heightIn(max = 560.dp)
+                .background(Color.White, RoundedCornerShape(28.dp)).padding(top = 18.dp, bottom = 10.dp)
+        ) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, Modifier.weight(1f), fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Text("${options.size}", color = Muted, fontSize = 12.sp)
+                Spacer(Modifier.width(12.dp))
+                Box(Modifier.size(32.dp).clip(CircleShape).background(Soft).clickable(onClick = onDismiss), contentAlignment = Alignment.Center) {
+                    Icon24("close", Ink, 16.dp)
+                }
+            }
+            if (options.size > 8) {
+                Spacer(Modifier.height(10.dp))
+                Box(Modifier.padding(horizontal = 16.dp)) { AppField(q, { q = it }, "Search $title") }
+            }
+            Spacer(Modifier.height(6.dp))
+            LazyColumn(Modifier.weight(1f, fill = false)) {
+                if (shown.isEmpty()) item { Text("Nothing found", color = Muted, modifier = Modifier.padding(20.dp)) }
+                items(shown) { o ->
+                    val sel = o == selected
+                    Row(
+                        Modifier.fillMaxWidth().background(if (sel) AccentSoft else Color.Transparent).clickable { onPick(o) }
+                            .padding(horizontal = 20.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(o, Modifier.weight(1f), fontSize = 15.sp, color = Ink, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal)
+                        if (sel) Icon24("check", Accent, 20.dp)
+                    }
+                }
+            }
         }
     }
 }
@@ -215,38 +385,6 @@ fun Dropdown(label: String, options: List<String>, selected: String, enabled: Bo
 fun Logo(size: Dp) {
     Box(Modifier.size(size).background(HeroBrush, CircleShape), contentAlignment = Alignment.Center) {
         Text("S", color = Color.White, fontWeight = FontWeight.Bold, fontSize = (size.value * 0.5f).sp)
-    }
-}
-
-@Composable
-fun HatchedBar(modifier: Modifier, solid: Boolean) {
-    Canvas(modifier) {
-        val r = 8.dp.toPx()
-        val shape = Path().apply { addRoundRect(RoundRect(0f, 0f, size.width, size.height, CornerRadius(r, r))) }
-        clipPath(shape) {
-            drawRect(Accent.copy(alpha = if (solid) 1f else 0.9f))
-            if (!solid) {
-                var x = -size.height
-                while (x < size.width) {
-                    drawLine(Color.White.copy(alpha = 0.4f), Offset(x, size.height), Offset(x + size.height, 0f), strokeWidth = 2.dp.toPx())
-                    x += 7.dp.toPx()
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun Ring(fraction: Float, label: String, modifier: Modifier = Modifier) {
-    Box(modifier.size(58.dp), contentAlignment = Alignment.Center) {
-        Canvas(Modifier.fillMaxSize()) {
-            val sw = 6.dp.toPx()
-            val topLeft = Offset(sw / 2, sw / 2)
-            val arcSize = Size(size.width - sw, size.height - sw)
-            drawArc(Color(0xFFE9E9EE), 0f, 360f, false, topLeft, arcSize, style = Stroke(sw))
-            drawArc(Accent, -90f, 360f * fraction.coerceIn(0f, 1f), false, topLeft, arcSize, style = Stroke(sw, cap = StrokeCap.Round))
-        }
-        Text(label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Ink)
     }
 }
 
@@ -437,7 +575,7 @@ fun LoginScreen(onLogin: (Session) -> Unit) {
                             try {
                                 val r = api("login") { put("email", email.trim()); put("password", pass) }
                                 if (keep) prefs.edit().putString("email", email.trim()).apply() else prefs.edit().remove("email").apply()
-                                onLogin(Session(r.getString("token"), r.optString("name"), email.trim()))
+                                onLogin(Session(r.getString("token"), r.optString("name"), email.trim(), r.optString("role", "user")))
                             } catch (e: Exception) { msg = e.message ?: "Error" }
                             busy = false
                         }
@@ -460,65 +598,101 @@ fun LoginScreen(onLogin: (Session) -> Unit) {
     }
 }
 
+// ---------------------------------------------------------------- app shell: top bar, bottom navigation
+@Composable
+fun TopBar(s: Session, display: String, first: String, onLogout: () -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    Row(
+        Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Logo(38.dp)
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text("Stock Tracker", fontWeight = FontWeight.SemiBold, fontSize = 17.sp, color = Ink)
+                Text("Secondary sales & stock", fontSize = 11.sp, color = Muted)
+            }
+        }
+        Box {
+            Box(
+                Modifier.size(40.dp).clip(CircleShape).background(Ink).clickable { menu = true },
+                contentAlignment = Alignment.Center
+            ) { Text(first.take(1).ifEmpty { "U" }, color = Color.White, fontWeight = FontWeight.Bold) }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                    Text(display, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                    Text(s.email, fontSize = 12.sp, color = Muted)
+                }
+                DropdownMenuItem(text = { Text("Log out", color = Red) }, onClick = { menu = false; onLogout() })
+            }
+        }
+    }
+}
+
+@Composable
+fun BottomBar(tab: Int, onTab: (Int) -> Unit) {
+    val tabs = listOf("Dashboard" to "dash", "Stock" to "stock", "Sales" to "sales")
+    NavigationBar(containerColor = Color.White, tonalElevation = 0.dp) {
+        tabs.forEachIndexed { i, t ->
+            NavigationBarItem(
+                selected = tab == i, onClick = { onTab(i) },
+                icon = { Icon24(t.second, if (tab == i) Accent else Muted) },
+                label = { Text(t.first, fontSize = 12.sp, fontWeight = if (tab == i) FontWeight.SemiBold else FontWeight.Normal) },
+                colors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = Accent, selectedTextColor = Accent, indicatorColor = AccentSoft,
+                    unselectedIconColor = Muted, unselectedTextColor = Muted
+                )
+            )
+        }
+    }
+}
+
 @Composable
 fun HomeScreen(s: Session, onLogout: () -> Unit) {
     var tab by remember { mutableIntStateOf(0) }
     var master by remember { mutableStateOf<Master?>(null) }
     var err by remember { mutableStateOf("") }
+    var tries by remember { mutableIntStateOf(0) }
+    val stockDraft = remember { StockDraft() }
+    val salesDraft = remember { SalesDraft() }
     val display = s.name.ifBlank { s.email.substringBefore("@") }
     val first = display.trim().substringBefore(" ").replaceFirstChar { it.uppercase() }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(tries) {
+        err = ""
         try { master = parseMaster(api("master", s.token)) }
         catch (e: SessionExpired) { onLogout() } catch (e: Exception) { err = e.message ?: "Failed to load lists" }
     }
     Column(Modifier.fillMaxSize().background(Bg).statusBarsPadding()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(Modifier.background(Color.White, Pill).padding(start = 8.dp, end = 16.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Logo(32.dp); Spacer(Modifier.width(8.dp))
-                Text("Stock Tracker", fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-            }
-            Row(
-                Modifier.clip(Pill).background(Color.White).clickable(onClick = onLogout).padding(start = 6.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(Modifier.size(32.dp).background(Ink, CircleShape), contentAlignment = Alignment.Center) {
-                    Text(first.take(1), color = Color.White, fontWeight = FontWeight.Bold)
-                }
-                Spacer(Modifier.width(8.dp))
-                Text("Logout", fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            }
-        }
-        val labels = listOf("Dashboard", "Stock", "Sales")
-        Row(Modifier.padding(horizontal = 16.dp).fillMaxWidth().background(Color.White, Pill).padding(4.dp)) {
-            labels.forEachIndexed { i, l ->
-                val sel = i == tab
-                Box(
-                    Modifier.weight(1f).height(40.dp).clip(Pill).background(if (sel) Ink else Color.Transparent).clickable { tab = i },
-                    contentAlignment = Alignment.Center
-                ) { Text(l, color = if (sel) Color.White else Ink, fontWeight = FontWeight.Medium, fontSize = 14.sp) }
-            }
-        }
-        if (err.isNotEmpty()) Box(Modifier.padding(16.dp)) { ErrorBox(err) }
+        TopBar(s, display, first, onLogout)
         val m = master
         Box(Modifier.weight(1f)) {
             if (tab == 0) Dashboard(s, "${greeting()}, $first", onLogout)
-            else if (m == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) }
-            else if (tab == 1) StockScreen(s, m, onLogout) { tab = 0 }
-            else SalesScreen(s, m, onLogout) { tab = 0 }
+            else if (m == null) {
+                if (err.isNotEmpty()) {
+                    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        ErrorBox(err)
+                        PillButton("Try again", { tries++ })
+                    }
+                } else Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) }
+            }
+            else if (tab == 1) StockScreen(s, m, stockDraft, onLogout) { tab = 0 }
+            else SalesScreen(s, m, salesDraft, onLogout) { tab = 0 }
         }
+        BottomBar(tab) { tab = it }
     }
 }
 
+// ---------------------------------------------------------------- dashboard
 @Composable
 fun Dashboard(s: Session, title: String, onLogout: () -> Unit) {
     var stats by remember { mutableStateOf<List<DistStat>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var err by remember { mutableStateOf("") }
     var reload by remember { mutableIntStateOf(0) }
+    var bu by remember { mutableStateOf("") }
+    var q by remember { mutableStateOf("") }
     LaunchedEffect(reload) {
         loading = true; err = ""
         try {
@@ -527,7 +701,8 @@ fun Dashboard(s: Session, title: String, onLogout: () -> Unit) {
                 val sk = d.getJSONArray("skus")
                 DistStat(
                     d.getString("region"), d.getString("zone"), d.getString("base"), d.getString("distributor"),
-                    d.getInt("stockSubs"), d.getInt("salesSubs"), d.getLong("totalPcs"), d.getDouble("totalSales"), d.optString("last"),
+                    d.getInt("stockSubs"), d.getInt("salesSubs"), d.getLong("totalPcs"), d.getDouble("totalSales"),
+                    d.optString("last"), d.optString("bu"),
                     (0 until sk.length()).map { sk.getJSONObject(it) }.map { k ->
                         SkuStat(k.getString("brand"), k.getString("sku"), k.getLong("stock"))
                     }
@@ -536,71 +711,99 @@ fun Dashboard(s: Session, title: String, onLogout: () -> Unit) {
         } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { err = e.message ?: "Error" }
         loading = false
     }
-    val totalStock = stats.sumOf { it.totalPcs }
-    val totalSales = stats.sumOf { it.totalSales }
-    val subs = stats.sumOf { it.stockSubs + it.salesSubs }
+    val buList = remember(stats) { sortBu(stats.map { it.bu }) }
+    val inBu = stats.filter { bu.isEmpty() || it.bu == bu }
+    val shown = inBu.filter { q.isBlank() || it.distributor.contains(q.trim(), ignoreCase = true) || it.base.contains(q.trim(), ignoreCase = true) }
+    val totalStock = inBu.sumOf { it.totalPcs }
+    val totalSales = inBu.sumOf { it.totalSales }
+    val subs = inBu.sumOf { it.stockSubs + it.salesSubs }
 
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { PageTitle(title, "Track stock and secondary sales for every distributor.") }
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item { PageTitle(title, "Your distributors at a glance.") }
+        if (buList.isNotEmpty()) item { BuChips(buList, bu) { bu = it } }
         if (loading) {
             item { Box(Modifier.fillMaxWidth().padding(40.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Accent) } }
         } else {
             if (err.isNotEmpty()) item { ErrorBox(err) }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        StatTile("Total Stock", "%,d".format(Locale.US, totalStock), "pcs", Modifier.weight(1f), hero = true)
-                        StatTile("Secondary Sales", compact(totalSales), "BDT", Modifier.weight(1f))
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        StatTile("Distributors", "${stats.size}", "active", Modifier.weight(1f))
-                        StatTile("Submissions", "$subs", "all time", Modifier.weight(1f))
-                    }
-                }
-            }
-            item { SalesChart(stats) }
+            item { HeroCard(if (bu.isEmpty()) "Secondary sales" else "$bu secondary sales", totalSales, totalStock, inBu.size, subs) }
+            item { TopDistributors(inBu) }
             item {
                 Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text("Distributors", fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Ring = share of total secondary sales", fontSize = 12.sp, color = Muted)
+                        Text("Distributors", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                        Text("${shown.size} shown", fontSize = 12.sp, color = Muted)
                     }
                     PillButton("Refresh", { reload++ }, Modifier.height(40.dp), dark = false)
                 }
             }
-            if (stats.isEmpty()) item { AppCard { Text("No data yet", color = Muted) } }
-            items(stats) { d -> DistCard(d, totalSales) }
+            item { AppField(q, { q = it }, "Search distributor or base") }
+            if (shown.isEmpty()) item { AppCard { Text("No data yet", color = Muted) } }
+            items(shown) { d -> DistCard(d, totalSales) }
         }
     }
 }
 
 @Composable
-fun SalesChart(stats: List<DistStat>) {
+fun HeroCard(label: String, sales: Double, stock: Long, dists: Int, subs: Int) {
+    Column(Modifier.fillMaxWidth().background(HeroBrush, CardShape).padding(20.dp)) {
+        Text(label, color = Color.White.copy(alpha = 0.8f), fontSize = 13.sp)
+        Spacer(Modifier.height(6.dp))
+        Text(compact(sales), color = Color.White, fontSize = 38.sp, lineHeight = 42.sp, fontWeight = FontWeight.SemiBold)
+        Text("BDT ${bdt(sales)}", color = Color.White.copy(alpha = 0.75f), fontSize = 12.sp)
+        Spacer(Modifier.height(16.dp))
+        Row(Modifier.fillMaxWidth().background(Color.White.copy(alpha = 0.14f), RoundedCornerShape(18.dp)).padding(vertical = 12.dp)) {
+            HeroStat("Stock", "${whole(stock)} pcs", Modifier.weight(1.3f))
+            HeroStat("Distributors", "$dists", Modifier.weight(1f))
+            HeroStat("Entries", "$subs", Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+fun HeroStat(label: String, value: String, modifier: Modifier) {
+    Column(modifier.padding(horizontal = 14.dp)) {
+        Text(label, color = Color.White.copy(alpha = 0.7f), fontSize = 11.sp)
+        Text(value, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+    }
+}
+
+@Composable
+fun TopDistributors(stats: List<DistStat>) {
     val top = stats.filter { it.totalSales > 0 }.sortedByDescending { it.totalSales }.take(6)
     val max = (top.firstOrNull()?.totalSales ?: 0.0).coerceAtLeast(1.0)
     AppCard {
-        Text("Secondary Sales", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-        Text("Top distributors by BDT", color = Muted, fontSize = 13.sp)
-        Spacer(Modifier.height(12.dp))
+        Text("Top distributors", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        Text("By secondary sales (BDT)", color = Muted, fontSize = 12.sp)
+        Spacer(Modifier.height(8.dp))
         if (top.isEmpty()) {
-            Text("No sales submitted yet", color = Muted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 24.dp))
+            Text("No sales submitted yet", color = Muted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 20.dp))
         } else {
-            Row(
-                Modifier.fillMaxWidth().height(170.dp).background(Soft, RoundedCornerShape(18.dp)).padding(10.dp),
-                verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                top.forEachIndexed { i, d ->
-                    val h = (100f * (d.totalSales / max).toFloat()).coerceAtLeast(6f)
-                    Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(compact(d.totalSales), fontSize = 10.sp, color = Muted, maxLines = 1)
-                        Spacer(Modifier.height(4.dp))
-                        HatchedBar(Modifier.fillMaxWidth(0.7f).height(h.dp), solid = i == 0)
-                        Spacer(Modifier.height(6.dp))
-                        Text(d.distributor, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Ink)
+            top.forEachIndexed { i, d ->
+                val frac = (d.totalSales / max).toFloat().coerceIn(0.03f, 1f)
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("${i + 1}", Modifier.width(22.dp), fontSize = 12.sp, color = Muted, fontWeight = FontWeight.SemiBold)
+                    Column(Modifier.weight(1f)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(d.distributor, Modifier.weight(1f), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Ink)
+                            Spacer(Modifier.width(8.dp))
+                            Text(compact(d.totalSales), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+                        }
+                        Spacer(Modifier.height(5.dp))
+                        Box(Modifier.fillMaxWidth().height(8.dp).background(Soft, Pill)) {
+                            Box(Modifier.fillMaxWidth(frac).fillMaxHeight().background(if (i == 0) Accent else Color(0xFF9D97F5), Pill))
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+fun Metric(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(label, fontSize = 11.sp, color = Muted)
+        Text(value, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Ink, maxLines = 1)
     }
 }
 
@@ -609,34 +812,41 @@ fun DistCard(d: DistStat, totalSales: Double) {
     var open by remember { mutableStateOf(false) }
     val share = if (totalSales > 0) (d.totalSales / totalSales).toFloat() else 0f
     AppCard(Modifier.clip(CardShape).clickable { open = !open }) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(verticalAlignment = Alignment.Top) {
             Column(Modifier.weight(1f)) {
-                Text(d.distributor, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text("${d.region} > ${d.zone} > ${d.base}", fontSize = 12.sp, color = Muted)
+                Text(d.distributor, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text("${d.base} · ${d.zone} · ${d.region}", fontSize = 12.sp, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Ring(share, "${(share * 100).roundToInt()}%")
+            if (d.bu.isNotEmpty()) { Spacer(Modifier.width(8.dp)); BuTag(d.bu) }
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(Modifier.fillMaxWidth()) {
+            Metric("Stock", "${whole(d.totalPcs)} pcs", Modifier.weight(1f))
+            Metric("Secondary sales", "BDT ${compact(d.totalSales)}", Modifier.weight(1.2f))
+            Metric("Share", "${(share * 100).roundToInt()}%", Modifier.weight(0.6f))
         }
         Spacer(Modifier.height(10.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatusChip("Stock ${d.totalPcs} pcs")
-            StatusChip("BDT ${bdt(d.totalSales)}")
+        Box(Modifier.fillMaxWidth().height(6.dp).background(Soft, Pill)) {
+            if (share > 0f) Box(Modifier.fillMaxWidth(share.coerceIn(0.02f, 1f)).fillMaxHeight().background(Accent, Pill))
         }
-        Spacer(Modifier.height(6.dp))
-        Text("${d.stockSubs} stock / ${d.salesSubs} sales submissions  |  Last: ${d.last}", fontSize = 11.sp, color = Muted)
         Spacer(Modifier.height(8.dp))
-        Text(if (open) "Hide SKU stock ▲" else "Show SKU stock ▼", fontSize = 12.sp, color = Accent, fontWeight = FontWeight.Medium)
+        Text("Last: ${d.last.ifEmpty { "-" }}  ·  ${d.stockSubs} stock / ${d.salesSubs} sales entries", fontSize = 11.sp, color = Muted)
+        Spacer(Modifier.height(6.dp))
+        Text(if (open) "Hide SKU stock ▲" else "Show SKU stock (${d.skus.size}) ▼", fontSize = 12.sp, color = Accent, fontWeight = FontWeight.Medium)
         if (open) {
             Spacer(Modifier.height(8.dp))
             Column(Modifier.fillMaxWidth().background(Soft, RoundedCornerShape(16.dp)).padding(12.dp)) {
-                Row(Modifier.fillMaxWidth()) {
-                    Text("Brand / SKU", Modifier.weight(2f), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    Text("Stock (pcs)", Modifier.weight(1f), fontWeight = FontWeight.Bold, fontSize = 12.sp, textAlign = TextAlign.End)
-                }
-                if (d.skus.isEmpty()) Text("No stock submitted yet", fontSize = 12.sp, color = Muted, modifier = Modifier.padding(top = 6.dp))
-                d.skus.forEach { k ->
+                if (d.skus.isEmpty()) Text("No stock submitted yet", fontSize = 12.sp, color = Muted)
+                d.skus.groupBy { it.brand }.forEach { (brand, list) ->
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
-                        Text("${k.brand} / ${k.sku}", Modifier.weight(2f), fontSize = 12.sp)
-                        Text("${k.stock}", Modifier.weight(1f), fontSize = 12.sp, textAlign = TextAlign.End)
+                        Text(brand, Modifier.weight(1f), fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Accent)
+                        Text("${whole(list.sumOf { it.stock })} pcs", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Accent)
+                    }
+                    list.forEach { k ->
+                        Row(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                            Text(k.sku, Modifier.weight(1f).padding(end = 8.dp), fontSize = 12.sp)
+                            Text(whole(k.stock), fontSize = 12.sp, textAlign = TextAlign.End)
+                        }
                     }
                 }
             }
@@ -644,132 +854,196 @@ fun DistCard(d: DistStat, totalSales: Double) {
     }
 }
 
+// ---------------------------------------------------------------- submit screens
+// BU first, then Region > Zone > Base > Distributor. Choosing a BU only offers that BU's distributors.
 @Composable
-fun LocationPicker(m: Master, l: Loc) {
-    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Dropdown("Region", m.regions.keys.toList(), l.region) { l.region = it; l.zone = ""; l.base = ""; l.dist = "" }
-        val zones = m.regions[l.region] ?: emptyMap()
-        Dropdown("Zone", zones.keys.toList(), l.zone, l.region.isNotEmpty()) { l.zone = it; l.base = ""; l.dist = "" }
-        val bases = zones[l.zone] ?: emptyMap()
-        Dropdown("Base", bases.keys.toList(), l.base, l.zone.isNotEmpty()) { l.base = it; l.dist = "" }
-        Dropdown("Distributor", bases[l.base] ?: emptyList(), l.dist, l.base.isNotEmpty()) { l.dist = it }
+fun LocationCard(m: Master, l: Loc) {
+    val bus = remember(m) { m.bus() }
+    val view = remember(m, l.bu) { m.forBu(l.bu) }
+    var editing by remember { mutableStateOf(false) }
+    val collapsed = l.dist.isNotEmpty() && !editing
+    AppCard {
+        Text("Distributor", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+        if (bus.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            SmallCaps("BUSINESS UNIT")
+            Spacer(Modifier.height(6.dp))
+            BuChips(bus, l.bu) { l.selectBu(it); editing = false }
+        }
+        Spacer(Modifier.height(14.dp))
+        if (collapsed) {
+            val b = m.distBu[l.key()] ?: ""
+            Row(
+                Modifier.fillMaxWidth().background(Soft, RoundedCornerShape(18.dp)).padding(start = 14.dp, top = 12.dp, bottom = 12.dp, end = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(l.dist, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Text("${l.base} · ${l.zone} · ${l.region}", fontSize = 12.sp, color = Muted)
+                    if (b.isNotEmpty()) { Spacer(Modifier.height(6.dp)); BuTag(b) }
+                }
+                TextButton({ editing = true }) { Text("Change", color = Accent, fontWeight = FontWeight.SemiBold) }
+            }
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                PickerField("Region", l.region, view.keys.toList(), hint = "Select region") { l.region = it; l.zone = ""; l.base = ""; l.dist = "" }
+                val zones = view[l.region] ?: emptyMap()
+                PickerField("Zone", l.zone, zones.keys.toList(), enabled = l.region.isNotEmpty(), hint = "Select zone") { l.zone = it; l.base = ""; l.dist = "" }
+                val bases = zones[l.zone] ?: emptyMap()
+                PickerField("Base", l.base, bases.keys.toList(), enabled = l.zone.isNotEmpty(), hint = "Select base") { l.base = it; l.dist = "" }
+                PickerField("Distributor", l.dist, bases[l.base] ?: emptyList(), enabled = l.base.isNotEmpty(), hint = "Select distributor") { l.dist = it; editing = false }
+            }
+        }
+    }
+}
+
+// Sticky bar at the bottom of the submit screens
+@Composable
+fun SubmitBar(summary: String, button: String, busy: Boolean, msg: String, onClick: () -> Unit) {
+    Column(Modifier.fillMaxWidth().background(Color.White).padding(horizontal = 16.dp, vertical = 10.dp)) {
+        if (msg.isNotEmpty()) { ErrorBox(msg); Spacer(Modifier.height(8.dp)) }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(summary, Modifier.weight(1f), fontSize = 13.sp, color = Muted, maxLines = 2)
+            Spacer(Modifier.width(12.dp))
+            PillButton(if (busy) "Submitting..." else button, onClick, enabled = !busy)
+        }
     }
 }
 
 @Composable
-fun StockScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit) {
-    val loc = remember { Loc() }
-    var brand by remember { mutableStateOf("") }
-    var sku by remember { mutableStateOf("") }
-    var pcs by remember { mutableStateOf("") }
-    val items = remember { mutableStateListOf<Item>() }
+fun StockScreen(s: Session, m: Master, d: StockDraft, onLogout: () -> Unit, onDone: () -> Unit) {
+    val loc = d.loc
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    // The distributor's business unit decides which brands/SKUs are offered (falls back to all).
-    val bu = m.distBu["${loc.region}|${loc.zone}|${loc.base}|${loc.dist}"] ?: ""
+    val ctx = LocalContext.current
+    // The chosen BU (or, with All, the distributor's own BU) decides which brands/SKUs are offered.
+    val bu = if (loc.bu.isNotEmpty()) loc.bu else (m.distBu[loc.key()] ?: "")
     val brandMap = m.buBrands[bu] ?: m.brands
-    LaunchedEffect(bu) { brand = ""; sku = "" }
+    val brand = if (brandMap.containsKey(d.brand)) d.brand else ""
+    val skuList = brandMap[brand] ?: emptyList()
+    val sku = if (skuList.contains(d.sku)) d.sku else ""
+    val pcsNum = d.pcs.toIntOrNull() ?: 0
+    val canAdd = brand.isNotEmpty() && sku.isNotEmpty() && pcsNum > 0
 
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { PageTitle("Submit Stock", "Record SKU-wise stock for a distributor.") }
-        item {
-            AppCard {
-                Text("Distributor", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(12.dp))
-                LocationPicker(m, loc)
-                if (bu.isNotEmpty()) { Spacer(Modifier.height(10.dp)); StatusChip("BU: $bu  (showing $bu SKUs)") }
-            }
-        }
-        item {
-            AppCard {
-                Text("Add Stock (SKU wise)", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(12.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Dropdown("Brand", brandMap.keys.toList(), brand) { brand = it; sku = "" }
-                    Dropdown("SKU", brandMap[brand] ?: emptyList(), sku, brand.isNotEmpty()) { sku = it }
-                    AppField(pcs, { pcs = it.filter(Char::isDigit) }, "Pcs", keyboard = KeyboardType.Number)
-                    PillButton("+ Add Item", {
-                        val n = pcs.toIntOrNull() ?: 0
-                        if (brand.isNotEmpty() && sku.isNotEmpty() && n > 0) { items.add(Item(brand, sku, n)); sku = ""; pcs = "" }
-                    }, Modifier.fillMaxWidth(), dark = false)
+    fun addItem() {
+        val newItem = Item(brand, sku, pcsNum)
+        val at = d.items.indexOfFirst { x -> x.brand == brand && x.sku == sku }
+        if (at >= 0) d.items[at] = newItem else d.items.add(newItem)   // same SKU again = replace its pcs
+        d.sku = ""; d.pcs = ""
+    }
+
+    fun submit() {
+        if (loc.dist.isEmpty() || d.items.isEmpty()) { msg = "Select a distributor and add at least one item"; return }
+        busy = true; msg = ""
+        scope.launch {
+            try {
+                api("submit_stock", s.token) {
+                    put("region", loc.region); put("zone", loc.zone); put("base", loc.base); put("distributor", loc.dist)
+                    put("items", JSONArray(d.items.map { JSONObject().put("brand", it.brand).put("sku", it.sku).put("pcs", it.pcs) }))
                 }
-            }
+                loc.reset(); d.items.clear(); d.brand = ""; d.sku = ""; d.pcs = ""
+                android.widget.Toast.makeText(ctx, "Stock submitted", android.widget.Toast.LENGTH_SHORT).show()
+                onDone()
+            } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { msg = e.message ?: "Failed" }
+            busy = false
         }
-        if (items.isNotEmpty()) item {
-            AppCard {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Text("Items (${items.size})", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                    StatusChip("${items.sumOf { it.pcs }} pcs total")
-                }
-                Spacer(Modifier.height(8.dp))
-                items.toList().forEach { i ->
-                    Row(
-                        Modifier.fillMaxWidth().padding(vertical = 4.dp).background(Soft, RoundedCornerShape(14.dp)).padding(start = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
-                            Text(i.sku, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                            Text("${i.brand}  |  ${i.pcs} pcs", fontSize = 11.sp, color = Muted)
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { PageTitle("Submit stock", "SKU-wise stock for one distributor.") }
+            item { LocationCard(m, loc) }
+            item {
+                AppCard {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text("Add SKU", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                        if (bu.isNotEmpty()) BuTag(bu)
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        PickerField("Brand", brand, brandMap.keys.toList(), hint = "Select brand") { d.brand = it; d.sku = "" }
+                        PickerField("SKU", sku, skuList, enabled = brand.isNotEmpty(), hint = "Select SKU") { d.sku = it }
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            AppField(d.pcs, { d.pcs = it.filter(Char::isDigit) }, "Pcs", Modifier.weight(1f), keyboard = KeyboardType.Number)
+                            PillButton("+ Add", { addItem() }, Modifier.height(56.dp), enabled = canAdd)
                         }
-                        TextButton({ items.remove(i) }) { Text("Remove", color = Red, fontSize = 12.sp) }
+                    }
+                }
+            }
+            if (d.items.isNotEmpty()) item {
+                AppCard {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text("Items (${d.items.size})", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                        StatusChip("${whole(d.items.sumOf { it.pcs.toLong() })} pcs total")
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    d.items.toList().forEach { i ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 4.dp).background(Soft, RoundedCornerShape(14.dp)).padding(start = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
+                                Text(i.sku, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                                Text("${i.brand}  ·  ${i.pcs} pcs", fontSize = 11.sp, color = Muted)
+                            }
+                            Box(Modifier.size(44.dp).clickable { d.items.remove(i) }, contentAlignment = Alignment.Center) { Icon24("close", Red, 18.dp) }
+                        }
                     }
                 }
             }
         }
-        item {
-            PillButton(if (busy) "Submitting..." else "Submit Stock", {
-                if (loc.dist.isEmpty() || items.isEmpty()) { msg = "Select distributor and add at least one item"; return@PillButton }
-                busy = true; msg = ""
-                scope.launch {
-                    try {
-                        api("submit_stock", s.token) {
-                            put("region", loc.region); put("zone", loc.zone); put("base", loc.base); put("distributor", loc.dist)
-                            put("items", JSONArray(items.map { JSONObject().put("brand", it.brand).put("sku", it.sku).put("pcs", it.pcs) }))
-                        }
-                        loc.reset(); items.clear(); onDone()
-                    } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { msg = e.message ?: "Failed" }
-                    busy = false
-                }
-            }, Modifier.fillMaxWidth(), enabled = !busy)
-            if (msg.isNotEmpty()) { Spacer(Modifier.height(10.dp)); ErrorBox(msg) }
-        }
+        SubmitBar(
+            if (d.items.isEmpty()) "No items yet" else "${d.items.size} items · ${whole(d.items.sumOf { it.pcs.toLong() })} pcs",
+            "Submit stock", busy, msg
+        ) { submit() }
     }
 }
 
 @Composable
-fun SalesScreen(s: Session, m: Master, onLogout: () -> Unit, onDone: () -> Unit) {
-    val loc = remember { Loc() }
-    var amount by remember { mutableStateOf("") }
+fun SalesScreen(s: Session, m: Master, d: SalesDraft, onLogout: () -> Unit, onDone: () -> Unit) {
+    val loc = d.loc
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        PageTitle("Submit Sales", "Record secondary sales in BDT.")
-        AppCard {
-            Text("Distributor", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(12.dp))
-            LocationPicker(m, loc)
+    val ctx = LocalContext.current
+    val amt = d.amount.toDoubleOrNull() ?: 0.0
+
+    fun submit() {
+        if (loc.dist.isEmpty() || amt <= 0.0) { msg = "Select a distributor and enter the sales amount"; return }
+        busy = true; msg = ""
+        scope.launch {
+            try {
+                api("submit_sales", s.token) {
+                    put("region", loc.region); put("zone", loc.zone); put("base", loc.base); put("distributor", loc.dist); put("amount", amt)
+                }
+                loc.reset(); d.amount = ""
+                android.widget.Toast.makeText(ctx, "Sales submitted", android.widget.Toast.LENGTH_SHORT).show()
+                onDone()
+            } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { msg = e.message ?: "Failed" }
+            busy = false
         }
-        AppCard {
-            Text("Secondary Sales", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(12.dp))
-            AppField(amount, { amount = it.filter { c -> c.isDigit() || c == '.' } }, "Amount (BDT)", keyboard = KeyboardType.Decimal)
-        }
-        PillButton(if (busy) "Submitting..." else "Submit Sales", {
-            val a = amount.toDoubleOrNull() ?: 0.0
-            if (loc.dist.isEmpty() || a <= 0.0) { msg = "Select distributor and enter sales amount"; return@PillButton }
-            busy = true; msg = ""
-            scope.launch {
-                try {
-                    api("submit_sales", s.token) {
-                        put("region", loc.region); put("zone", loc.zone); put("base", loc.base); put("distributor", loc.dist); put("amount", a)
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { PageTitle("Submit sales", "Secondary sales for one distributor, in BDT.") }
+            item { LocationCard(m, loc) }
+            item {
+                AppCard {
+                    Text("Secondary sales", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(12.dp))
+                    AppField(d.amount, { d.amount = it.filter { c -> c.isDigit() || c == '.' } }, "Amount (BDT)", keyboard = KeyboardType.Decimal)
+                    if (amt > 0.0) {
+                        Spacer(Modifier.height(10.dp))
+                        StatusChip("BDT ${bdt(amt)}  ·  ${compact(amt)}")
                     }
-                    loc.reset(); amount = ""; onDone()
-                } catch (e: SessionExpired) { onLogout() } catch (e: Exception) { msg = e.message ?: "Failed" }
-                busy = false
+                }
             }
-        }, Modifier.fillMaxWidth(), enabled = !busy)
-        if (msg.isNotEmpty()) ErrorBox(msg)
+        }
+        SubmitBar(
+            if (loc.dist.isEmpty()) "Select a distributor" else if (amt > 0.0) "BDT ${bdt(amt)}" else "Enter the amount",
+            "Submit sales", busy, msg
+        ) { submit() }
     }
 }

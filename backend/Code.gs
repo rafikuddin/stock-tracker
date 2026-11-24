@@ -4,14 +4,17 @@
  *   CUSTOMER_MASTER (tabs Adhesive / Corporate / Thinner)  -> Region > Zone > Base > Distributor
  *   PRODUCT_MASTER  (tab SKU_MASTER)                        -> Brand > SKU
  * Tabs are found by their column headers, so tab names do not matter.
- * Other tabs: Users, Stock_Items, Sales_Log (created automatically).
+ * Other tabs: Users (Email, PasswordHash, Name, Active, Role), Stock_Items, Sales_Log (created automatically).
+ * Role = admin  ->  may add and edit submitted data on the web page. Everyone else can only view and download.
  * Deploy: Deploy > New deployment > Web app > Execute as: Me, Who has access: Anyone
  */
 const SALT = 'CHANGE_THIS_SECRET_SALT';   // KEEP the value you already use
 const TOKEN_TTL = 21600;
 // (TOKEN_TTL above is in seconds; CacheService allows max 6h)
-const STOCK_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','Brand','SKU','Pcs','DistributorCode','BU','SKUCode'];
-const SALES_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','SecondarySalesBDT','DistributorCode','BU'];
+// EditedBy / EditedAt are filled only when an admin changes a row on the web page.
+const STOCK_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','Brand','SKU','Pcs','DistributorCode','BU','SKUCode','EditedBy','EditedAt'];
+const SALES_HDR = ['SubmissionID','Timestamp','Email','Region','Zone','Base','Distributor','SecondarySalesBDT','DistributorCode','BU','EditedBy','EditedAt'];
+// Users tab: A Email | B PasswordHash | C Name | D Active | E Role  ("admin" = may add/edit data on the web page)
 
 function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
@@ -38,21 +41,53 @@ function doGet(e) {
   return json_({ ok: true, msg: 'Stock API running' });
 }
 
+/* ---------- Roles ---------- */
+function userRow_(email) {
+  const em = String(email || '').trim().toLowerCase();
+  return rows_('Users').find(function (r) { return String(r[0]).toLowerCase() === em; });
+}
+function roleOf_(u) { return u && String(u[4] || '').trim().toLowerCase() === 'admin' ? 'admin' : 'user'; }
+function isAdmin_(email) {
+  const u = userRow_(email);
+  return !!u && String(u[3]).toUpperCase() !== 'FALSE' && roleOf_(u) === 'admin';
+}
+function msg_(err) { return String(err && err.message ? err.message : err); }
+
 /* ---------- Web viewer (called by Index.html via google.script.run) ---------- */
 function webLogin(email, password) { return login_({ email: email, password: password }); }
+
+// Same rows as rows_(), but each keeps its sheet row number (used by admin edits).
+function rowsX_(name) {
+  const sh = ss_().getSheetByName(name);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues()
+    .map(function (v, i) { return { row: i + 2, v: v }; });
+}
 
 function webData(token) {
   const em = CacheService.getScriptCache().get('t_' + token);
   if (!em) return { ok: false, error: 'SESSION_EXPIRED' };
   const tz = Session.getScriptTimeZone();
   function ts(v) { return Utilities.formatDate(new Date(v), tz, 'yyyy-MM-dd HH:mm'); }
-  const stock = rows_('Stock_Items').filter(function (r) { return r[0]; }).map(function (r) {
-    return { id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], brand: r[7], sku: r[8], pcs: Number(r[9]) || 0, dcode: r[10] || '', bu: r[11] || '', skucode: r[12] || '' };
+  const stock = rowsX_('Stock_Items').filter(function (x) { return x.v[0]; }).map(function (x) {
+    const r = x.v;
+    return { row: x.row, id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], brand: r[7], sku: r[8], pcs: Number(r[9]) || 0,
+      dcode: r[10] || '', bu: r[11] || '', skucode: r[12] || '', eb: r[13] || '', ea: r[14] ? ts(r[14]) : '' };
   });
-  const sales = rows_('Sales_Log').filter(function (r) { return r[0]; }).map(function (r) {
-    return { id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], amount: Number(r[7]) || 0, dcode: r[8] || '', bu: r[9] || '' };
+  const sales = rowsX_('Sales_Log').filter(function (x) { return x.v[0]; }).map(function (x) {
+    const r = x.v;
+    return { row: x.row, id: String(r[0]), ts: ts(r[1]), by: r[2], region: r[3], zone: r[4], base: r[5], dist: r[6], amount: Number(r[7]) || 0,
+      dcode: r[8] || '', bu: r[9] || '', eb: r[10] || '', ea: r[11] ? ts(r[11]) : '' };
   });
-  return { ok: true, master: master_(), stock: stock, sales: sales };
+  const u = userRow_(em);
+  return { ok: true, master: master_(), stock: stock, sales: sales, admin: isAdmin_(em), me: { email: em, name: u ? u[2] : em } };
+}
+
+// Admin-only writes from the web page. b = {op, ...}
+function webAdmin(token, b) {
+  const em = CacheService.getScriptCache().get('t_' + token);
+  if (!em) return { ok: false, error: 'SESSION_EXPIRED' };
+  try { return admin_(em, b || {}); } catch (err) { return { ok: false, error: msg_(err) }; }
 }
 
 function doPost(e) {
@@ -67,19 +102,20 @@ function doPost(e) {
       case 'submit_sales': return json_(submitSales_(email, b));
       case 'dashboard':    return json_(dashboard_());
       case 'webdata':      return json_(webData(b.token));
+      case 'admin':        return json_(admin_(email, b));
       default:             return json_({ ok: false, error: 'Unknown action' });
     }
-  } catch (err) { return json_({ ok: false, error: String(err) }); }
+  } catch (err) { return json_({ ok: false, error: msg_(err) }); }
 }
 
 function login_(b) {
   const em = String(b.email || '').trim().toLowerCase();
-  const u = rows_('Users').find(function (r) { return String(r[0]).toLowerCase() === em; });
+  const u = userRow_(em);
   if (!u || String(u[3]).toUpperCase() === 'FALSE' || u[1] !== hash_(String(b.password || '')))
     return { ok: false, error: 'Invalid email or password' };
   const token = Utilities.getUuid();
   CacheService.getScriptCache().put('t_' + token, em, TOKEN_TTL);
-  return { ok: true, token: token, name: u[2] };
+  return { ok: true, token: token, name: u[2], role: roleOf_(u) };
 }
 
 /* ---------- Master data (read from the two dump tabs) ---------- */
@@ -151,25 +187,43 @@ function master_() {
   return { ok: true, regions: M.regions, brands: M.brands, distBu: distBu, buBrands: M.buBrands };
 }
 
+function locKey_(b) { return [b.region, b.zone, b.base, b.distributor].join('|'); }
+function buClash_(M, bu, si, sku) {
+  if (bu && M.buBrands[bu] && si && si.bu && si.bu !== bu)
+    throw new Error('"' + sku + '" is a ' + si.bu + ' SKU, but this distributor is ' + bu + '. Remove it and try again.');
+}
+
+// Validates and builds the Stock_Items rows of one submission. Does NOT take the lock - callers do.
+// strict (admin): the distributor must exist in the master and pcs may be 0.
+function buildStockRows_(M, email, b, when, strict) {
+  const di = M.distInfo[locKey_(b)];
+  if (strict && !di) throw new Error('Pick Region, Zone, Base and Distributor from the lists.');
+  const d = di || { code: '', bu: '' }, id = Utilities.getUuid();
+  const rows = b.items.map(function (i) {
+    const p = Number(i.pcs);
+    if (!(strict ? p >= 0 && Math.floor(p) === p : p > 0)) throw new Error('Invalid pcs');
+    const si = M.skuInfo[i.brand + '|' + i.sku];
+    if (strict && !si) throw new Error('Pick Brand and SKU from the lists.');
+    buClash_(M, d.bu, si, i.sku);
+    return [id, when, email, b.region, b.zone, b.base, b.distributor, i.brand, i.sku, p, d.code, d.bu, si ? si.code : ''];
+  });
+  return { id: id, rows: rows };
+}
+function appendRows_(name, hdr, rows) {
+  const sh = sheet_(name, hdr);
+  const out = rows.map(function (r) { const x = r.slice(); while (x.length < hdr.length) x.push(''); return x; });
+  sh.getRange(sh.getLastRow() + 1, 1, out.length, hdr.length).setValues(out);
+}
+
 // body: {region, zone, base, distributor, items:[{brand, sku, pcs}]}
 function submitStock_(email, b) {
   if (!b.distributor || !b.items || !b.items.length) return { ok: false, error: 'Distributor and items required' };
   const M = loadMaster_();
-  const di = M.distInfo[[b.region, b.zone, b.base, b.distributor].join('|')] || { code: '', bu: '' };
   const lock = LockService.getScriptLock(); lock.waitLock(20000);
   try {
-    const id = Utilities.getUuid(), now = new Date();
-    const rows = b.items.map(function (i) {
-      const p = Number(i.pcs);
-      if (!(p > 0)) throw new Error('Invalid pcs');
-      const si = M.skuInfo[i.brand + '|' + i.sku] || { code: '', bu: '' };
-      if (di.bu && M.buBrands[di.bu] && si.bu && si.bu !== di.bu)
-        throw new Error('"' + i.sku + '" is a ' + si.bu + ' SKU, but this distributor is ' + di.bu + '. Remove it and try again.');
-      return [id, now, email, b.region, b.zone, b.base, b.distributor, i.brand, i.sku, p, di.code, di.bu, si.code];
-    });
-    const sh = sheet_('Stock_Items', STOCK_HDR);
-    sh.getRange(sh.getLastRow() + 1, 1, rows.length, STOCK_HDR.length).setValues(rows);
-    return { ok: true, id: id };
+    const r = buildStockRows_(M, email, b, new Date(), false);
+    appendRows_('Stock_Items', STOCK_HDR, r.rows);
+    return { ok: true, id: r.id };
   } finally { lock.releaseLock(); }
 }
 
@@ -177,13 +231,97 @@ function submitStock_(email, b) {
 function submitSales_(email, b) {
   const amt = Number(b.amount);
   if (!b.distributor || !(amt > 0)) return { ok: false, error: 'Distributor and amount required' };
-  const di = loadMaster_().distInfo[[b.region, b.zone, b.base, b.distributor].join('|')] || { code: '', bu: '' };
+  const di = loadMaster_().distInfo[locKey_(b)] || { code: '', bu: '' };
   const lock = LockService.getScriptLock(); lock.waitLock(20000);
   try {
     const id = Utilities.getUuid();
-    sheet_('Sales_Log', SALES_HDR).appendRow([id, new Date(), email, b.region, b.zone, b.base, b.distributor, amt, di.code, di.bu]);
+    appendRows_('Sales_Log', SALES_HDR, [[id, new Date(), email, b.region, b.zone, b.base, b.distributor, amt, di.code, di.bu]]);
     return { ok: true, id: id };
   } finally { lock.releaseLock(); }
+}
+
+/* ---------- Admin: add / edit submitted data (web page only) ---------- */
+function dayStr_(d) { return Utilities.formatDate(new Date(d), Session.getScriptTimeZone(), 'yyyy-MM-dd'); }
+// dateStr 'yyyy-MM-dd' (blank = keep `base`, or now). Keeps the clock time of `base`. Future dates are refused.
+function whenFrom_(dateStr, base) {
+  const bs = base ? new Date(base) : new Date();
+  if (!dateStr) return bs;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateStr))) throw new Error('Date must look like 2026-11-23');
+  if (dateStr > dayStr_(new Date())) throw new Error('Date cannot be in the future');
+  if (dayStr_(bs) === dateStr) return bs;
+  const tz = Session.getScriptTimeZone();
+  return Utilities.parseDate(dateStr + ' ' + Utilities.formatDate(bs, tz, 'HH:mm:ss'), tz, 'yyyy-MM-dd HH:mm:ss');
+}
+
+function admin_(email, b) {
+  if (!isAdmin_(email)) return { ok: false, error: 'Only an admin can add or edit data on the web page.' };
+  const M = loadMaster_();
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    switch (b.op) {
+      case 'add_stock':  return adminAddStock_(email, M, b);
+      case 'edit_stock': return adminEditStock_(email, M, b);
+      case 'add_sales':  return adminAddSales_(email, M, b);
+      case 'edit_sales': return adminEditSales_(email, M, b);
+      default:           return { ok: false, error: 'Unknown admin action' };
+    }
+  } finally { lock.releaseLock(); }
+}
+
+function adminAddStock_(email, M, b) {
+  if (!b.items || !b.items.length) return { ok: false, error: 'Add at least one SKU' };
+  const r = buildStockRows_(M, email, b, whenFrom_(b.date, null), true);
+  appendRows_('Stock_Items', STOCK_HDR, r.rows);
+  return { ok: true, id: r.id, added: r.rows.length };
+}
+
+function adminAddSales_(email, M, b) {
+  const amt = Number(b.amount), di = M.distInfo[locKey_(b)];
+  if (!di) return { ok: false, error: 'Pick Region, Zone, Base and Distributor from the lists.' };
+  if (!(amt >= 0)) return { ok: false, error: 'Enter the sales amount in BDT' };
+  const id = Utilities.getUuid();
+  appendRows_('Sales_Log', SALES_HDR, [[id, whenFrom_(b.date, null), email, b.region, b.zone, b.base, b.distributor, amt, di.code, di.bu]]);
+  return { ok: true, id: id, added: 1 };
+}
+
+// The row is found by its sheet row number; the SubmissionID must still match, so a row that moved is never overwritten.
+function rowForEdit_(name, hdr, b) {
+  const sh = sheet_(name, hdr), row = Number(b.row);
+  if (!(row >= 2) || row > sh.getLastRow()) throw new Error('Row not found. Refresh the page and try again.');
+  const cur = sh.getRange(row, 1, 1, hdr.length).getValues()[0];
+  if (String(cur[0]) !== String(b.id)) throw new Error('This row changed in the Sheet. Refresh the page and try again.');
+  return { sh: sh, row: row, cur: cur };
+}
+
+function adminEditStock_(email, M, b) {
+  const x = rowForEdit_('Stock_Items', STOCK_HDR, b), cur = x.cur;
+  const p = Number(b.pcs);
+  if (!(p >= 0) || Math.floor(p) !== p) return { ok: false, error: 'Pcs must be a whole number' };
+  const same = b.region === cur[3] && b.zone === cur[4] && b.base === cur[5] && b.distributor === cur[6];
+  const di = M.distInfo[locKey_(b)];
+  if (!di && !same) return { ok: false, error: 'Pick Region, Zone, Base and Distributor from the lists.' };
+  const sameSku = b.brand === cur[7] && b.sku === cur[8];
+  const si = M.skuInfo[b.brand + '|' + b.sku];
+  if (!si && !sameSku) return { ok: false, error: 'Pick Brand and SKU from the lists.' };
+  const dcode = di ? di.code : cur[10], bu = di ? di.bu : cur[11];
+  if (si) buClash_(M, bu, si, b.sku);
+  const when = whenFrom_(b.date, cur[1]);
+  x.sh.getRange(x.row, 2).setValue(when);
+  x.sh.getRange(x.row, 4, 1, 12).setValues([[b.region, b.zone, b.base, b.distributor, b.brand, b.sku, p, dcode, bu, si ? si.code : cur[12], email, new Date()]]);
+  return { ok: true };
+}
+
+function adminEditSales_(email, M, b) {
+  const x = rowForEdit_('Sales_Log', SALES_HDR, b), cur = x.cur;
+  const amt = Number(b.amount);
+  if (!(amt >= 0)) return { ok: false, error: 'Enter the sales amount in BDT' };
+  const same = b.region === cur[3] && b.zone === cur[4] && b.base === cur[5] && b.distributor === cur[6];
+  const di = M.distInfo[locKey_(b)];
+  if (!di && !same) return { ok: false, error: 'Pick Region, Zone, Base and Distributor from the lists.' };
+  const when = whenFrom_(b.date, cur[1]);
+  x.sh.getRange(x.row, 2).setValue(when);
+  x.sh.getRange(x.row, 4, 1, 9).setValues([[b.region, b.zone, b.base, b.distributor, amt, di ? di.code : cur[8], di ? di.bu : cur[9], email, new Date()]]);
+  return { ok: true };
 }
 
 // Per distributor: stock (latest value per SKU), secondary sales (sum of BDT), counts, last date.
@@ -192,12 +330,13 @@ function dashboard_() {
   function get(r, z, b, d) {
     const k = [r, z, b, d].join('|');
     return agg[k] = agg[k] || { region: r, zone: z, base: b, distributor: d, stockSubs: 0, salesSubs: 0,
-      totalPcs: 0, totalSales: 0, last: '', skus: {}, ids: {} };
+      totalPcs: 0, totalSales: 0, last: '', bu: '', skus: {}, ids: {} };
   }
   function fmt(t) { return Utilities.formatDate(new Date(t), tz, 'yyyy-MM-dd HH:mm'); }
   rows_('Stock_Items').forEach(function (r) {
     if (!r[0]) return;
     const a = get(r[3], r[4], r[5], r[6]);
+    if (r[11]) a.bu = String(r[11]);
     if (!a.ids[r[0]]) { a.ids[r[0]] = 1; a.stockSubs++; }
     const t = fmt(r[1]); if (t > a.last) a.last = t;
     const k = r[7] + '|' + r[8], ts = new Date(r[1]).getTime(), p = Number(r[9]) || 0;
@@ -207,6 +346,7 @@ function dashboard_() {
   rows_('Sales_Log').forEach(function (r) {
     if (!r[0]) return;
     const a = get(r[3], r[4], r[5], r[6]); a.salesSubs++; a.totalSales += Number(r[7]) || 0;
+    if (r[9]) a.bu = String(r[9]);
     const t = fmt(r[1]); if (t > a.last) a.last = t;
   });
   const data = Object.keys(agg).sort().map(function (k) {
@@ -221,23 +361,47 @@ function dashboard_() {
 
 /* ---------- Sheet menu: manage users ---------- */
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('Stock App').addItem('Add / reset user', 'addUser').addItem('Check master data', 'checkMaster').addToUi();
+  SpreadsheetApp.getUi().createMenu('Stock App').addItem('Add / reset user', 'addUser').addItem('Set user role (admin / user)', 'setRole').addItem('Check master data', 'checkMaster').addToUi();
+}
+function ensureRoleHeader_(sh) {
+  if (!String(sh.getRange(1, 5).getValue()).trim()) sh.getRange(1, 5).setValue('Role').setFontWeight('bold');
 }
 function addUser() {
   const ui = SpreadsheetApp.getUi();
   const e = ui.prompt('User email'); if (e.getSelectedButton() !== ui.Button.OK) return;
   const p = ui.prompt('Password'); if (p.getSelectedButton() !== ui.Button.OK) return;
   const n = ui.prompt('Display name'); if (n.getSelectedButton() !== ui.Button.OK) return;
+  const a = ui.alert('Admin?', 'Make this user an admin?\nYes = can add and edit data on the web page.\nNo = normal user (can only view and download on the web).', ui.ButtonSet.YES_NO);
+  const role = a === ui.Button.YES ? 'admin' : 'user';
+  const sh = ss_().getSheetByName('Users'), em = e.getResponseText().trim().toLowerCase();
+  ensureRoleHeader_(sh);
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]).toLowerCase() === em) {
+      sh.getRange(i + 1, 1, 1, 5).setValues([[em, hash_(p.getResponseText()), n.getResponseText(), true, role]]);
+      ui.alert('User updated (' + role + ')'); return;
+    }
+  }
+  sh.appendRow([em, hash_(p.getResponseText()), n.getResponseText(), true, role]);
+  ui.alert('User added (' + role + ')');
+}
+
+// Change only the role of an existing user (password stays as it is).
+function setRole() {
+  const ui = SpreadsheetApp.getUi();
+  const e = ui.prompt('Email of the user'); if (e.getSelectedButton() !== ui.Button.OK) return;
   const sh = ss_().getSheetByName('Users'), em = e.getResponseText().trim().toLowerCase();
   const data = sh.getDataRange().getValues();
   for (let i = 1; i < data.length; i++) {
     if (String(data[i][0]).toLowerCase() === em) {
-      sh.getRange(i + 1, 1, 1, 4).setValues([[em, hash_(p.getResponseText()), n.getResponseText(), true]]);
-      ui.alert('User updated'); return;
+      const a = ui.alert('Role', 'Make ' + em + ' an admin?\nYes = admin (can add and edit data on the web page).\nNo = normal user.', ui.ButtonSet.YES_NO);
+      ensureRoleHeader_(sh);
+      const role = a === ui.Button.YES ? 'admin' : 'user';
+      sh.getRange(i + 1, 5).setValue(role);
+      ui.alert(em + ' is now: ' + role); return;
     }
   }
-  sh.appendRow([em, hash_(p.getResponseText()), n.getResponseText(), true]);
-  ui.alert('User added');
+  ui.alert('User not found: ' + em);
 }
 
 /* Shows what the app will load from the two dump tabs - run it after importing/refreshing them */
